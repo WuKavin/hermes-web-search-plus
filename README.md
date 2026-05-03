@@ -9,38 +9,34 @@ Multi-provider web search, URL extraction, quality reports, and opt-in research 
 ## Quick Start
 
 ```bash
-git clone https://github.com/robbyczgw-cla/hermes-web-search-plus.git ~/.hermes/plugins/web-search-plus
-cd ~/.hermes/hermes-agent
-source venv/bin/activate
-pip install requests
+# 1) Install + enable the Hermes plugin
+hermes plugins install robbyczgw-cla/hermes-web-search-plus --enable
+
+# 2) Add at least one provider key to Hermes' env file
+hermes config env-path
+$EDITOR "$(hermes config env-path)"
+
+# Recommended minimum keys:
+# BRAVE_API_KEY=...
+# TAVILY_API_KEY=...
+# EXA_API_KEY=...
+# LINKUP_API_KEY=...
+
+# 3) Restart/reload your Hermes session so plugin tools are registered
+# CLI: exit and start `hermes` again, or use /reset in-session
+# Gateway/Telegram: /restart, then /reset
+
+# 4) Verify from the plugin CLI if you want a shell smoke test
 cd ~/.hermes/plugins/web-search-plus
-cp .env.template .env          # fill in at least one provider key
-# Optional: pip install httpx  # only needed for Exa deep/deep-reasoning
+python3 search.py --query "Hermes Agent latest release" --provider auto --quality-report
 ```
 
-Important:
-- Use the Hermes virtualenv, not your system Python.
-- Run `pip` only after `source ~/.hermes/hermes-agent/venv/bin/activate` (or from `~/.hermes/hermes-agent` via `source venv/bin/activate`).
-- If you test the plugin from the CLI, prefer `~/.hermes/hermes-agent/venv/bin/python` or activate the Hermes venv first.
+Notes:
+- `hermes plugins install ... --enable` clones into `~/.hermes/plugins/web-search-plus` and enables the plugin for future sessions.
+- Keys live in Hermes' env file, not in the repo. Use `hermes config env-path` instead of guessing the path.
+- If you manually run `pip`, use the Hermes environment — not random system Python. The normal plugin install path should not need manual config-file editing.
 
-Then enable the plugin in `~/.hermes/config.yaml`:
-
-```yaml
-plugins:
-  enabled:
-    - web-search-plus
-```
-
-Also enable the plugin toolset alongside the built-in `web` toolset so both are available:
-
-```yaml
-tools:
-  enabled:
-    - web
-    - web-search-plus
-```
-
-Finally restart Hermes (or `/restart` + `/reset` in gateway chats) and use the plugin tools:
+After restart/reset, use the plugin tools:
 
 - `web_search_plus` — multi-provider web search and auto-routing
 - `web_extract_plus` — provider-specific URL extraction via Firecrawl, Linkup, Tavily, Exa, or You.com
