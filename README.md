@@ -95,12 +95,12 @@ QUERIT_API_KEY=***        # https://querit.ai
 LINKUP_API_KEY=***        # https://linkup.so — source-backed search + fetch
 FIRECRAWL_API_KEY=***     # https://firecrawl.dev — search + scrape/extract
 PERPLEXITY_API_KEY=***    # https://perplexity.ai/settings/api
-KILOCODE_API_KEY=your-key      # Perplexity via Kilo Gateway fallback
-YOU_API_KEY=your-key           # https://api.you.com
+KILOCODE_API_KEY=***      # Alternate credential path for the `perplexity` provider via Kilo Gateway
+YOU_API_KEY=***           # https://api.you.com
 SEARXNG_INSTANCE_URL=https://your-instance.example.com
 ```
 
-> Python 3.8+ required. For Exa deep research: `pip install httpx` (optional).
+> Python 3.8+ required. The normal Hermes plugin install handles dependencies. For manual/local development, install the pinned runtime deps with `python3 -m pip install -r requirements.txt` inside the Hermes/plugin environment.
 
 ---
 

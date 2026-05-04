@@ -25,6 +25,7 @@ _PROVIDER_ENV_KEYS = [
     "LINKUP_API_KEY",
     "FIRECRAWL_API_KEY",
     "PERPLEXITY_API_KEY",
+    "KILOCODE_API_KEY",
     "YOU_API_KEY",
     "SEARXNG_INSTANCE_URL",
 ]
@@ -249,9 +250,11 @@ def register(ctx: Any) -> None:
             "Automatically selects the best provider based on query intent: "
             "Serper for shopping/news/facts, Tavily for research/analysis, "
             "Exa for semantic discovery, Querit for multilingual/real-time, "
+            "Brave for general web search, "
             "Linkup for source-backed grounding/citations, "
             "Firecrawl for web search plus optional scrape-ready results, "
-            "Perplexity for direct answers. "
+            "Perplexity for direct answers, You.com for real-time snippets, "
+            "and SearXNG for privacy-focused/self-hosted search. "
             "Set depth='deep' for Exa multi-source synthesis, 'deep-reasoning' for complex cross-document analysis. "
             "Override with provider param if needed."
         ),
