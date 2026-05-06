@@ -1,5 +1,14 @@
 # Changelog
 
+## [v1.7.1] — 2026-05-06
+
+### 🐛 Fixed
+- Brave Search no longer fails on gzip-compressed API responses returned by `urllib.request.urlopen()`.
+- Shared HTTP response parsing now handles `gzip`/`x-gzip`, gzip magic bytes, and `deflate` bodies for both GET and POST provider requests, including HTTP error bodies.
+
+### 🧪 Tests
+- Added regression coverage for gzip/deflate response decoding and Brave GET parsing through the shared urllib client.
+
 ## [v1.7.0] — 2026-05-03
 
 ### ✨ Added
