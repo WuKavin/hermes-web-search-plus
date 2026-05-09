@@ -1,6 +1,6 @@
 name: web-search-plus
-version: "1.7.1"
-description: "Multi-provider web search, URL extraction, quality reports, and opt-in research mode"
+version: "1.8.0"
+description: "Multi-provider web search, URL extraction, cited answers, quality reports, and opt-in research mode"
 author: robbyczgw-cla
 requires_env: []
 optional_env:
@@ -18,4 +18,23 @@ optional_env:
 provides_tools:
   - web_search_plus
   - web_extract_plus
-provides_hooks: []
+  - web_answer_plus
+provides_hooks:
+  - on_session_start
+onboarding:
+  setup_command: "python ~/.hermes/plugins/web-search-plus/setup.py setup"
+  status_command: "python ~/.hermes/plugins/web-search-plus/setup.py status"
+  note: "No single provider key is globally required. Add at least one search-capable provider for web_search_plus/web_answer_plus; add Linkup or another extraction-capable provider for web_extract_plus and fuller cited answers. This standalone setup script avoids relying on unreleased Hermes core plugin-CLI support."
+  recommended_env:
+    - name: TAVILY_API_KEY
+      description: "Tavily — recommended starter for search/research (1k free/month)"
+      url: "https://tavily.com"
+      secret: true
+    - name: LINKUP_API_KEY
+      description: "Linkup — cheap extraction and citations (€5 free monthly credits)"
+      url: "https://www.linkup.so"
+      secret: true
+    - name: BRAVE_API_KEY
+      description: "Brave Search — independent general web index ($5 free monthly credits)"
+      url: "https://api.search.brave.com/app/keys"
+      secret: true
