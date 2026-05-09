@@ -10,15 +10,17 @@
   <img alt="Hermes Plugin" src="https://img.shields.io/badge/Hermes-plugin-a78bfa.svg">
 </p>
 
-**Web search and citation-ready answers for Hermes — bring any one of 10 provider options and the plugin unlocks the tools your keys can actually support.** Linkup is preferred for extraction, but not required; search-only setups still work and degrade honestly.
+**Web search, extraction, and optional cited answers for Hermes — bring any one of 10 provider options and the plugin unlocks the tools your keys can actually support.** Linkup is preferred for extraction, but not required; search-only setups still work and degrade honestly.
 
 `web-search-plus` adds three Hermes tools:
 
 - `web_search_plus` — routed multi-provider web search with quality diagnostics
-- `web_answer_plus` — answer-first, citation-ready responses from search + selected source extraction
+- `web_answer_plus` — optional beta answer-synthesis layer for explicit summaries/cited answers
 - `web_extract_plus` — clean URL extraction via provider backends
 
 > Ported from [web-search-plus-plugin](https://github.com/robbyczgw-cla/web-search-plus-plugin) for the [Hermes Agent](https://github.com/NousResearch/hermes-agent) plugin API.
+
+> 🧪 **Beta note:** `web_answer_plus` is optional. It is a synthesis layer on top of search, not a replacement for `web_search_plus`. For current events, sports lineups, schedules, scores, prices, weather, or when you mainly need source discovery, start with `web_search_plus`. Use `web_answer_plus` when the user explicitly asks for a written answer, summary, or cited synthesis.
 
 ---
 
@@ -113,22 +115,34 @@ Capabilities: search=yes, extraction=yes, answer=yes
 
 ### `web_answer_plus`
 
-Use this when the user wants the answer, not just raw search results.
+Optional beta tool for when the user explicitly wants a written answer, summary, or cited synthesis. It is slower and more source-ranking-sensitive than `web_search_plus`, so do not treat it as the default search path.
+
+Use `web_search_plus` first when the query is about:
+
+- current events, breaking news, live facts, sports lineups, schedules, scores, or standings
+- weather, prices, shopping availability, or quick factual lookup
+- raw source discovery, provider comparison, or cases where the source list matters more than prose
+
+Use `web_answer_plus` when the user asks for:
+
+- a concise answer with sources
+- a research brief or summary
+- citation-ready source notes from a few selected pages
 
 ```python
-web_answer_plus(query="What changed in Hermes Agent this week?")
-# → answer + sources + confidence/freshness metadata
+web_answer_plus(query="Summarize what changed in Hermes Agent this week", output="brief")
+# → beta synthesis: answer + sources from selected results
 
 web_answer_plus(
-    query="Best DAC amps under 500 EUR in Austria",
+    query="Compare DAC amps under 500 EUR in Austria from review sources",
     mode="deep",
     sources=6,
     country="AT",
 )
-# → broader research-mode answer with Austrian locale hint
+# → broader research-mode synthesis with Austrian locale hint
 
 web_answer_plus(query="OpenAI latest model announcements", freshness="week", output="brief")
-# → short answer scoped to recent results
+# → explicit recent-answer request; freshness is opt-in
 
 web_answer_plus(query="Sources about Linkup extraction pricing", output="sources")
 # → sources-only list
@@ -138,9 +152,11 @@ Defaults are intentionally conservative:
 
 - `quick` mode asks for 3 sources and extracts up to 2 URLs.
 - `deep` mode asks for 6 sources and uses research mode, with extraction still hard-capped at 5 URLs.
-- `freshness="auto"` applies recency filters only when the query looks current/news/date-sensitive.
+- `freshness="none"` is the default to avoid over-triggering recency on words like “current” or “aktuell”. Set `freshness="auto"`, `day`, `week`, `month`, or `year` explicitly when recency should shape search.
 - Linkup is preferred for extraction; other extraction providers are used through the normal fallback chain.
 - If no extraction provider is configured, answers are snippet-backed and carry an explicit warning.
+
+A real failure case from dogfooding: `Österreich Startelf WM 2026 Qualifikation aktuelle Aufstellung` is better handled by `web_search_plus`; answer synthesis can drift toward schedule or wrong-sport sources if recency is pushed too hard.
 
 Parameters:
 
@@ -149,7 +165,7 @@ Parameters:
 | `query` | string | **required** | Question or research query to answer from the web |
 | `mode` | string | `"quick"` | `quick` or `deep` |
 | `sources` | integer | quick `3`, deep `6` | Citation-ready sources to return, max 10 |
-| `freshness` | string | `"auto"` | `auto`, `none`, `day`, `week`, `month`, `year` |
+| `freshness` | string | `"none"` | `none`, `auto`, `day`, `week`, `month`, `year` |
 | `output` | string | `"answer"` | `answer`, `brief`, `sources`, or `json` |
 | `language` | string | `"auto"` | Optional language code such as `de`, `en`, `es`, `fr` |
 | `country` | string | `"auto"` | Optional country/region code such as `AT`, `DE`, `US` |

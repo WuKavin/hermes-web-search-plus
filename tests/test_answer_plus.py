@@ -94,12 +94,33 @@ def test_web_answer_plus_tool_registered_with_simple_user_facing_schema():
     schema = ctx.tools["web_answer_plus"]["schema"]
     props = schema["parameters"]["properties"]
     assert props["mode"]["enum"] == ["quick", "deep"]
-    assert props["freshness"]["default"] == "auto"
+    assert props["freshness"]["default"] == "none"
     assert props["language"]["default"] == "auto"
     assert props["country"]["default"] == "auto"
     assert props["sources"]["default"] == 3
     assert props["max_extracts"]["maximum"] == 5
     assert "provider" not in props
+
+
+def test_web_answer_plus_defaults_do_not_apply_freshness_filter(monkeypatch):
+    monkeypatch.setenv("LINKUP_API_KEY", "lk-test")
+    calls = {"search": []}
+
+    def fake_search(**kwargs):
+        calls["search"].append(kwargs)
+        return {"provider": "brave", "results": []}
+
+    monkeypatch.setattr(wsp, "_run_search", fake_search)
+    ctx = FakeCtx()
+    wsp.register(ctx)
+
+    payload = wsp.json.loads(ctx.tools["web_answer_plus"]["handler"]({
+        "query": "Österreich Startelf WM 2026 Qualifikation aktuelle Aufstellung",
+        "output": "json",
+    }))
+
+    assert payload["freshness"]["applied"] == "none"
+    assert calls["search"][0]["time_range"] is None
 
 
 def test_web_answer_plus_json_output_uses_quick_defaults_and_extracts_top_sources(monkeypatch):
@@ -135,6 +156,7 @@ def test_web_answer_plus_json_output_uses_quick_defaults_and_extracts_top_source
 
     raw = ctx.tools["web_answer_plus"]["handler"]({
         "query": "latest rsETH backing status",
+        "freshness": "auto",
         "output": "json",
     })
     payload = wsp.json.loads(raw)

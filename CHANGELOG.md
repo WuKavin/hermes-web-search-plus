@@ -1,5 +1,21 @@
 # Changelog
 
+## [v1.8.1] — 2026-05-09
+
+### 🔧 Changed
+- Reframed `web_answer_plus` as an **optional beta answer-synthesis layer**, not a default replacement for `web_search_plus`.
+- Tightened the registered tool description so agents prefer `web_search_plus` for current events, sports lineups, schedules, scores, standings, prices, weather, and raw source discovery.
+- Changed the default `web_answer_plus` freshness behavior from `auto` to `none`. Set `freshness="auto"`, `day`, `week`, `month`, or `year` explicitly when recency should shape source selection.
+
+### 📚 Docs
+- Added clear “use `web_search_plus` first” guidance for fast/current/source-discovery queries.
+- Added `web_answer_plus` beta guidance, pros/cons, and a dogfooded failure case around Austrian football lineup/current-query drift.
+- Updated README examples to show answer synthesis as opt-in and freshness as explicit.
+
+### 🧪 Tests
+- Added regression coverage proving default `web_answer_plus` calls do **not** apply a freshness filter.
+- Test suite: 82/82 unit tests passing locally.
+
 ## [v1.8.0] — 2026-05-09
 
 ### ✨ Added

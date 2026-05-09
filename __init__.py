@@ -1,11 +1,11 @@
 """
-web-search-plus — Hermes Plugin v1.8.0
+web-search-plus — Hermes Plugin v1.8.1
 Multi-provider web search, URL extraction, quality reports, and opt-in research mode.
 Ported from robbyczgw-cla/web-search-plus-plugin (OpenClaw) to Hermes Plugin API.
 """
 from __future__ import annotations
 
-__version__ = "1.8.0"
+__version__ = "1.8.1"
 
 import argparse
 import getpass
@@ -951,7 +951,7 @@ def _compose_answer_payload(
     query: str,
     mode: str = "quick",
     sources: Optional[int] = None,
-    freshness: str = "auto",
+    freshness: str = "none",
     language: str = "auto",
     country: str = "auto",
     include_counterpoints: Optional[bool] = None,
@@ -1290,9 +1290,9 @@ def register(ctx: Any) -> None:
     answer_schema = {
         "name": "web_answer_plus",
         "description": (
-            "User-facing cited web answer tool. Searches, deduplicates, extracts top sources, "
-            "and returns a concise answer with citation-ready sources. Keep the interface simple: "
-            "choose quick or deep, source count, freshness, output shape, and optional locale."
+            "Optional beta answer-synthesis layer. Use only when the user explicitly asks for a "
+            "written answer, summary, or cited synthesis; prefer web_search_plus for current events, "
+            "sports lineups, schedules, scores, standings, prices, weather, and raw source discovery."
         ),
         "parameters": {
             "type": "object",
@@ -1300,7 +1300,7 @@ def register(ctx: Any) -> None:
                 "query": {"type": "string", "description": "Question or research query to answer from the web."},
                 "mode": {"type": "string", "enum": ["quick", "deep"], "default": "quick", "description": "quick = fast answer from a few sources; deep = broader research-mode answer."},
                 "sources": {"type": "integer", "default": 3, "minimum": 1, "maximum": 10, "description": "Number of citation-ready sources to return. Default quick=3; deep usually uses 6."},
-                "freshness": {"type": "string", "enum": ["auto", "none", "day", "week", "month", "year"], "default": "auto", "description": "Recency filter. auto detects current/news/latest/date-sensitive queries."},
+                "freshness": {"type": "string", "enum": ["auto", "none", "day", "week", "month", "year"], "default": "none", "description": "Optional recency filter. Default none avoids over-triggering on words like current/aktuell; set auto/day/week/month/year explicitly when needed."},
                 "output": {"type": "string", "enum": ["answer", "brief", "sources", "json"], "default": "answer", "description": "Return markdown answer, short brief, sources-only list, or structured JSON."},
                 "language": {"type": "string", "default": "auto", "description": "BCP-47-ish language code such as de/en/es/fr, or auto."},
                 "country": {"type": "string", "default": "auto", "description": "Country/region code such as AT/DE/US/FR, or auto."},
@@ -1312,7 +1312,7 @@ def register(ctx: Any) -> None:
     }
 
     def answer_handler(args_or_query, mode: str = "quick", sources: Optional[int] = None,
-                       freshness: str = "auto", output: str = "answer", language: str = "auto",
+                       freshness: str = "none", output: str = "answer", language: str = "auto",
                        country: str = "auto", include_counterpoints: Optional[bool] = None,
                        max_extracts: Optional[int] = None, **kwargs) -> str:
         if isinstance(args_or_query, dict):
