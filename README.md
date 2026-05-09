@@ -92,6 +92,40 @@ Presets:
 
 The CLI never prints secret values. It writes keys into the active Hermes `.env` file, then reminds you to restart Hermes or run `/reset` so the tools re-register.
 
+### Routing preferences
+
+Key setup and routing behavior are separate on purpose: secrets live in `.env`; provider behavior lives in `config.json`.
+
+```bash
+# Show provider/key status and routing preferences
+python ~/.hermes/plugins/web-search-plus/setup.py status --json
+python ~/.hermes/plugins/web-search-plus/setup.py config show --json
+
+# Prefer one fixed provider instead of auto-routing
+python ~/.hermes/plugins/web-search-plus/setup.py config set-default brave
+
+# Turn auto-routing back on
+python ~/.hermes/plugins/web-search-plus/setup.py config set-routing on
+
+# Tune auto-routing order and fallback
+python ~/.hermes/plugins/web-search-plus/setup.py config set-priority tavily,linkup,brave,serper
+python ~/.hermes/plugins/web-search-plus/setup.py config set-fallback tavily
+python ~/.hermes/plugins/web-search-plus/setup.py config disable perplexity
+python ~/.hermes/plugins/web-search-plus/setup.py config enable perplexity
+python ~/.hermes/plugins/web-search-plus/setup.py config set-threshold 0.45
+
+# Preview changes without touching disk
+python ~/.hermes/plugins/web-search-plus/setup.py config set-default brave --dry-run
+```
+
+Notes:
+
+- `set-default <provider>` disables auto-routing and makes `--provider auto` resolve to that provider.
+- `set-routing on` restores query-based routing while keeping the saved default for later.
+- `set-priority` accepts comma-separated provider names, normalizes case/whitespace, and ignores duplicates with a warning.
+- `setup.py --config-path /path/to/config.json` points the helper at a custom config; `WEB_SEARCH_PLUS_CONFIG=/path/to/config.json` points `search.py` at the same file.
+- `config reset --yes` backs up the existing file before writing fresh defaults.
+
 ---
 
 ## Capability model

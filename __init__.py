@@ -15,7 +15,9 @@ import logging
 import os
 import re
 import signal
+import shutil
 import subprocess
+import tempfile
 import sys
 import threading
 import time
@@ -252,6 +254,179 @@ def _get_hermes_env_path() -> Path:
         return Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes")) / ".env"
 
 
+
+
+_SETUP_PROVIDER_NAMES = {item["provider"] for item in _PROVIDER_CATALOG}
+_DEFAULT_PROVIDER_PRIORITY = ["tavily", "linkup", "querit", "exa", "firecrawl", "perplexity", "brave", "serper", "you", "searxng"]
+_ROUTING_PROVIDER_NAMES = set(_DEFAULT_PROVIDER_PRIORITY)
+
+
+def _get_plugin_config_path() -> Path:
+    """Return the behavior config path shared with search.py."""
+    override = os.environ.get("WEB_SEARCH_PLUS_CONFIG")
+    if override:
+        return Path(override)
+    return Path(__file__).parent.parent / "config.json"
+
+
+def _default_behavior_config() -> Dict[str, Any]:
+    return {
+        "version": 1,
+        "default_provider": None,
+        "auto_routing": {
+            "enabled": True,
+            "fallback_provider": "serper",
+            "provider_priority": list(_DEFAULT_PROVIDER_PRIORITY),
+            "disabled_providers": [],
+            "confidence_threshold": 0.3,
+        },
+    }
+
+
+def _normalize_provider_name(provider: str) -> str:
+    """Normalize a setup-provider name from the onboarding catalog."""
+    normalized = (provider or "").strip().lower()
+    if normalized not in _SETUP_PROVIDER_NAMES:
+        valid = ", ".join(sorted(_SETUP_PROVIDER_NAMES))
+        print(f"Unknown provider: {provider}. Valid providers: {valid}", file=sys.stderr)
+        raise SystemExit(2)
+    return normalized
+
+
+def _normalize_routing_provider(provider: str) -> str:
+    """Normalize a provider that search.py can actually route to."""
+    normalized = (provider or "").strip().lower()
+    if normalized == "kilo-perplexity":
+        normalized = "perplexity"
+    if normalized not in _ROUTING_PROVIDER_NAMES:
+        valid = ", ".join(sorted(_ROUTING_PROVIDER_NAMES))
+        print(f"Unknown routing provider: {provider}. Valid routing providers: {valid}", file=sys.stderr)
+        raise SystemExit(2)
+    return normalized
+
+
+def _normalize_provider_csv(value: str, *, routing: bool = True) -> List[str]:
+    providers: List[str] = []
+    seen = set()
+    for raw in (value or "").split(","):
+        if not raw.strip():
+            continue
+        provider = _normalize_routing_provider(raw) if routing else _normalize_provider_name(raw)
+        if provider in seen:
+            print(f"warning: duplicate provider ignored: {provider}", file=sys.stderr)
+            continue
+        seen.add(provider)
+        providers.append(provider)
+    if not providers:
+        raise SystemExit("At least one provider is required.")
+    return providers
+
+
+def _merge_behavior_config(user_config: Mapping[str, Any]) -> Dict[str, Any]:
+    config = _default_behavior_config()
+    if not isinstance(user_config, Mapping):
+        return config
+    config["version"] = int(user_config.get("version", 1) or 1)
+    default_provider = user_config.get("default_provider")
+    if default_provider:
+        config["default_provider"] = _normalize_routing_provider(str(default_provider))
+    auto_user = user_config.get("auto_routing", {}) if isinstance(user_config.get("auto_routing", {}), Mapping) else {}
+    auto = dict(config["auto_routing"])
+    if "enabled" in auto_user:
+        auto["enabled"] = bool(auto_user.get("enabled"))
+    if auto_user.get("fallback_provider"):
+        auto["fallback_provider"] = _normalize_routing_provider(str(auto_user["fallback_provider"]))
+    if auto_user.get("provider_priority"):
+        if isinstance(auto_user["provider_priority"], str):
+            auto["provider_priority"] = _normalize_provider_csv(auto_user["provider_priority"], routing=True)
+        else:
+            auto["provider_priority"] = _normalize_provider_csv(",".join(str(p) for p in auto_user["provider_priority"]), routing=True)
+    if "disabled_providers" in auto_user:
+        disabled = auto_user.get("disabled_providers") or []
+        if isinstance(disabled, str):
+            auto["disabled_providers"] = _normalize_provider_csv(disabled, routing=True) if disabled.strip() else []
+        else:
+            auto["disabled_providers"] = _normalize_provider_csv(",".join(str(p) for p in disabled), routing=True) if disabled else []
+    if "confidence_threshold" in auto_user:
+        threshold = float(auto_user["confidence_threshold"])
+        if threshold < 0.0 or threshold > 1.0:
+            raise SystemExit("confidence_threshold must be between 0.0 and 1.0")
+        auto["confidence_threshold"] = threshold
+    config["auto_routing"] = auto
+    if config["default_provider"] and config["default_provider"] in set(auto.get("disabled_providers", [])):
+        raise SystemExit("default_provider cannot be disabled")
+    return config
+
+
+def _quarantine_behavior_config(path: Path, reason: str) -> None:
+    broken = path.with_name(path.name + f".broken-{int(time.time())}")
+    try:
+        path.rename(broken)
+        print(f"warning: invalid config moved to {broken}: {reason}", file=sys.stderr)
+    except OSError as exc:
+        print(f"warning: invalid config could not be moved: {exc}; reason: {reason}", file=sys.stderr)
+
+
+def _load_behavior_config(path: Optional[Path] = None) -> Dict[str, Any]:
+    path = path or _get_plugin_config_path()
+    if not path.exists():
+        return _default_behavior_config()
+    try:
+        raw = json.loads(path.read_text() or "{}")
+        return _merge_behavior_config(raw)
+    except json.JSONDecodeError as exc:
+        _quarantine_behavior_config(path, str(exc))
+        return _default_behavior_config()
+    except (SystemExit, ValueError, TypeError) as exc:
+        _quarantine_behavior_config(path, str(exc))
+        return _default_behavior_config()
+
+
+def _atomic_write_json(path: Path, data: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=2, sort_keys=True)
+            f.write("\n")
+        os.replace(tmp_name, path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+def _write_behavior_config(path: Path, data: Mapping[str, Any], *, dry_run: bool = False, backup: bool = False) -> None:
+    rendered = json.dumps(data, indent=2, sort_keys=True) + "\n"
+    if dry_run:
+        print(rendered, end="")
+        return
+    if backup and path.exists():
+        backup_path = path.with_name(path.name + f".bak-{int(time.time())}")
+        shutil.copy2(path, backup_path)
+        print(f"Backup written: {backup_path}")
+    _atomic_write_json(path, data)
+
+
+def _routing_summary(config: Mapping[str, Any]) -> str:
+    auto = config.get("auto_routing", {}) if isinstance(config.get("auto_routing"), Mapping) else {}
+    lines = [
+        "Routing:",
+        f"  auto-routing: {'on' if auto.get('enabled', True) else 'off'}",
+        f"  default provider: {config.get('default_provider') or 'none'}",
+        f"  fallback provider: {auto.get('fallback_provider', 'serper')}",
+        "  priority: " + ", ".join(auto.get("provider_priority", _DEFAULT_PROVIDER_PRIORITY)),
+        "  disabled: " + (", ".join(auto.get("disabled_providers", [])) or "none"),
+        f"  confidence threshold: {auto.get('confidence_threshold', 0.3)}",
+    ]
+    return "\n".join(lines)
+
+
+def _status_payload(env: Optional[Mapping[str, str]] = None, config: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
+    return {"providers": _provider_config_status(env), "routing": dict(config or _default_behavior_config())}
+
 def _setup_state_path() -> Path:
     return Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes")) / "state" / "web-search-plus-onboarding.json"
 
@@ -459,17 +634,146 @@ def _web_search_plus_cli_setup(parser: argparse.ArgumentParser) -> None:
     subs = parser.add_subparsers(dest="web_search_plus_command")
     status = subs.add_parser("status", help="Show a setup dashboard without printing secrets")
     status.add_argument("--plain", action="store_true", help="Print compact legacy text instead of the dashboard")
+    status.add_argument("--json", action="store_true", help="Print status as JSON")
     status.add_argument("--env-path", help="Override Hermes .env path for status checks")
+    status.add_argument("--config-path", help="Override web-search-plus config.json path")
+
     setup = subs.add_parser("setup", help="Run the provider-key setup wizard")
     setup.add_argument("providers", nargs="*", help="Provider names to configure (overrides --preset)")
     setup.add_argument("--preset", default="all", help="starter, lean, search, extract, or all (default: all)")
     setup.add_argument("--open", action="store_true", help="Open signup URLs in a browser before prompting")
     setup.add_argument("--env-path", help="Override Hermes .env path")
+    setup.add_argument("--config-path", help="Override web-search-plus config.json path")
     setup.add_argument("--show-values", action="store_true", help="Use visible input instead of hidden secret prompts")
-    setup.add_argument("--dry-run", action="store_true", help="Show the setup plan without writing .env")
+    setup.add_argument("--dry-run", action="store_true", help="Show the setup/routing plan without writing files")
+    setup.add_argument("--routing", choices=["auto", "fixed"], help="Persist routing mode after key setup")
+    setup.add_argument("--default-provider", help="Provider to use when routing is fixed/off")
+    setup.add_argument("--provider-priority", help="Comma-separated auto-routing priority")
+    setup.add_argument("--disable-providers", help="Comma-separated providers to exclude from auto-routing")
+    setup.add_argument("--fallback-provider", help="Fallback provider when no route is available")
+    setup.add_argument("--confidence-threshold", type=float, help="Auto-routing confidence threshold 0.0-1.0")
+
     list_cmd = subs.add_parser("list", help="List supported providers, capabilities, and signup URLs")
     list_cmd.add_argument("--json", action="store_true", help="Print provider catalog as JSON")
+
+    config_cmd = subs.add_parser("config", help="Inspect or change routing preferences")
+    config_subs = config_cmd.add_subparsers(dest="config_command")
+    show = config_subs.add_parser("show", help="Show routing config")
+    show.add_argument("--json", action="store_true")
+    show.add_argument("--config-path")
+    set_routing = config_subs.add_parser("set-routing", help="Turn auto-routing on or off")
+    set_routing.add_argument("mode", choices=["on", "off"])
+    set_routing.add_argument("--config-path")
+    set_routing.add_argument("--dry-run", action="store_true")
+    set_default = config_subs.add_parser("set-default", help="Use one fixed provider when auto-routing is off")
+    set_default.add_argument("provider")
+    set_default.add_argument("--config-path")
+    set_default.add_argument("--dry-run", action="store_true")
+    set_fallback = config_subs.add_parser("set-fallback", help="Set fallback provider")
+    set_fallback.add_argument("provider")
+    set_fallback.add_argument("--config-path")
+    set_fallback.add_argument("--dry-run", action="store_true")
+    set_priority = config_subs.add_parser("set-priority", help="Set comma-separated auto-routing priority")
+    set_priority.add_argument("providers")
+    set_priority.add_argument("--config-path")
+    set_priority.add_argument("--dry-run", action="store_true")
+    disable = config_subs.add_parser("disable", help="Disable a provider for auto-routing")
+    disable.add_argument("provider")
+    disable.add_argument("--config-path")
+    disable.add_argument("--dry-run", action="store_true")
+    enable = config_subs.add_parser("enable", help="Re-enable a provider for auto-routing")
+    enable.add_argument("provider")
+    enable.add_argument("--config-path")
+    enable.add_argument("--dry-run", action="store_true")
+    threshold = config_subs.add_parser("set-threshold", help="Set routing confidence threshold")
+    threshold.add_argument("value", type=float)
+    threshold.add_argument("--config-path")
+    threshold.add_argument("--dry-run", action="store_true")
+    reset = config_subs.add_parser("reset", help="Reset routing config to defaults and back up existing config")
+    reset.add_argument("--config-path")
+    reset.add_argument("--dry-run", action="store_true")
+    reset.add_argument("--yes", action="store_true")
     parser.set_defaults(func=_web_search_plus_cli_command)
+
+
+def _apply_setup_routing_args(config: Dict[str, Any], args: Any) -> Dict[str, Any]:
+    updated = _merge_behavior_config(config)
+    auto = dict(updated["auto_routing"])
+    if getattr(args, "routing", None):
+        auto["enabled"] = getattr(args, "routing") == "auto"
+    if getattr(args, "default_provider", None):
+        updated["default_provider"] = _normalize_routing_provider(getattr(args, "default_provider"))
+        auto["enabled"] = False
+    if getattr(args, "provider_priority", None):
+        auto["provider_priority"] = _normalize_provider_csv(getattr(args, "provider_priority"), routing=True)
+    if getattr(args, "disable_providers", None):
+        auto["disabled_providers"] = _normalize_provider_csv(getattr(args, "disable_providers"), routing=True)
+    if getattr(args, "fallback_provider", None):
+        auto["fallback_provider"] = _normalize_routing_provider(getattr(args, "fallback_provider"))
+    if getattr(args, "confidence_threshold", None) is not None:
+        value = float(getattr(args, "confidence_threshold"))
+        if value < 0.0 or value > 1.0:
+            raise SystemExit("confidence threshold must be between 0.0 and 1.0")
+        auto["confidence_threshold"] = value
+    updated["auto_routing"] = auto
+    return _merge_behavior_config(updated)
+
+
+def _handle_config_command(args: Any) -> None:
+    subcommand = getattr(args, "config_command", None) or "show"
+    path = Path(getattr(args, "config_path", None) or _get_plugin_config_path())
+    config = _load_behavior_config(path)
+    dry_run = bool(getattr(args, "dry_run", False))
+
+    if subcommand == "show":
+        if getattr(args, "json", False):
+            print(json.dumps(config, indent=2, sort_keys=True))
+        else:
+            print(_routing_summary(config))
+        return
+
+    if subcommand == "set-routing":
+        config["auto_routing"]["enabled"] = getattr(args, "mode") == "on"
+    elif subcommand == "set-default":
+        provider = _normalize_routing_provider(getattr(args, "provider"))
+        config["default_provider"] = provider
+        config["auto_routing"]["enabled"] = False
+    elif subcommand == "set-fallback":
+        config["auto_routing"]["fallback_provider"] = _normalize_routing_provider(getattr(args, "provider"))
+    elif subcommand == "set-priority":
+        config["auto_routing"]["provider_priority"] = _normalize_provider_csv(getattr(args, "providers"), routing=True)
+    elif subcommand == "disable":
+        provider = _normalize_routing_provider(getattr(args, "provider"))
+        disabled = list(config["auto_routing"].get("disabled_providers", []))
+        if provider == config.get("default_provider"):
+            raise SystemExit("default_provider cannot be disabled")
+        if provider not in disabled:
+            disabled.append(provider)
+        config["auto_routing"]["disabled_providers"] = disabled
+    elif subcommand == "enable":
+        provider = _normalize_routing_provider(getattr(args, "provider"))
+        config["auto_routing"]["disabled_providers"] = [p for p in config["auto_routing"].get("disabled_providers", []) if p != provider]
+    elif subcommand == "set-threshold":
+        value = float(getattr(args, "value"))
+        if value < 0.0 or value > 1.0:
+            raise SystemExit("confidence threshold must be between 0.0 and 1.0")
+        config["auto_routing"]["confidence_threshold"] = value
+    elif subcommand == "reset":
+        if not getattr(args, "yes", False) and not dry_run:
+            raise SystemExit("Refusing to reset without --yes. Use --dry-run to preview.")
+        config = _default_behavior_config()
+        _write_behavior_config(path, config, dry_run=dry_run, backup=True)
+        if not dry_run:
+            print(f"✓ Reset routing config: {path}")
+        return
+    else:
+        raise SystemExit(f"Unknown config command: {subcommand}")
+
+    config = _merge_behavior_config(config)
+    _write_behavior_config(path, config, dry_run=dry_run)
+    if not dry_run:
+        print(f"✓ Updated routing config: {path}")
+        print(_routing_summary(config))
 
 
 def _web_search_plus_cli_command(args: Any) -> None:
@@ -478,19 +782,32 @@ def _web_search_plus_cli_command(args: Any) -> None:
         print(_render_provider_catalog(json_output=getattr(args, "json", False)))
         return
 
+    if command == "config":
+        _handle_config_command(args)
+        return
+
     if command == "status":
         env_path = getattr(args, "env_path", None)
+        config_path = getattr(args, "config_path", None)
         env = _read_env_file(Path(env_path)) if env_path else None
-        print(_render_setup_guidance(env=env, fancy=not getattr(args, "plain", False)))
+        config = _load_behavior_config(Path(config_path)) if config_path else _load_behavior_config()
+        if getattr(args, "json", False):
+            print(json.dumps(_status_payload(env, config), indent=2, sort_keys=True))
+        else:
+            print(_render_setup_guidance(env=env, fancy=not getattr(args, "plain", False)))
+            print("\n" + _routing_summary(config))
         return
 
     if command == "setup":
         selected = set(getattr(args, "providers", None) or [])
+        selected = {_normalize_provider_name(p) for p in selected} if selected else set()
         catalog = [item for item in _PROVIDER_CATALOG if item["provider"] in selected] if selected else _providers_for_preset(getattr(args, "preset", "all"))
         if not catalog:
             raise SystemExit("No matching providers. Run `python ~/.hermes/plugins/web-search-plus/setup.py list`.")
 
         env_path = Path(getattr(args, "env_path", None) or _get_hermes_env_path())
+        config_path = Path(getattr(args, "config_path", None) or _get_plugin_config_path())
+        config = _apply_setup_routing_args(_load_behavior_config(config_path), args)
         print(_render_status_dashboard(_provider_config_status(_read_env_file(env_path))))
         print("\nSetup plan:")
         for item in catalog:
@@ -499,8 +816,10 @@ def _web_search_plus_cli_command(args: Any) -> None:
             print(f"  • {item['display_name']} ({item['provider']}) — {item['env']} — {caps}{rec}")
             print(f"    {item['signup_url']}")
         print(f"\nTarget env file: {env_path}")
+        print(f"Target config file: {config_path}")
+        print(_routing_summary(config))
         if getattr(args, "dry_run", False):
-            print("Dry run only; no keys written.")
+            print("Dry run only; no keys or routing config written.")
             return
 
         values: Dict[str, str] = {}
@@ -514,23 +833,31 @@ def _web_search_plus_cli_command(args: Any) -> None:
                 else:
                     value = getpass.getpass(prompt).strip()
             except EOFError:
-                # Non-interactive stdin (CI, scripted smoke tests) should behave like
-                # pressing Enter for the remaining prompts, not crash the setup helper.
                 value = ""
             if value:
                 values[item["env"]] = value
-        if not values:
+        routing_args_present = any(
+            getattr(args, name, None) is not None
+            for name in ["routing", "default_provider", "provider_priority", "disable_providers", "fallback_provider", "confidence_threshold"]
+        )
+        wrote_any = False
+        if values:
+            result = _upsert_env_values(env_path, values)
+            changed = sorted(result["updated"] + result["added"])
+            print(f"\n✓ Configured {len(changed)} provider key(s) in {env_path}: " + ", ".join(changed))
+            print("✓ Secrets were not printed.")
+            wrote_any = True
+        if routing_args_present:
+            _write_behavior_config(config_path, config)
+            print(f"✓ Saved routing preferences in {config_path}")
+            wrote_any = True
+        if not wrote_any:
             print("No keys entered; nothing changed.")
             return
-        result = _upsert_env_values(env_path, values)
-        changed = sorted(result["updated"] + result["added"])
-        print(f"\n✓ Configured {len(changed)} provider key(s) in {env_path}: " + ", ".join(changed))
-        print("✓ Secrets were not printed.")
-        print("Next: restart Hermes or run /reset so tools re-register with the new credentials.")
+        print("Next: restart Hermes or run /reset so tools re-register with the new credentials/preferences.")
         return
 
     raise SystemExit(f"Unknown web-search-plus command: {command}")
-
 
 def _web_search_plus_slash_setup(raw_args: str = "") -> str:
     """In-session lightweight status/help command."""

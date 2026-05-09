@@ -280,6 +280,8 @@ _load_env_file()
 # =============================================================================
 
 DEFAULT_CONFIG = {
+    "version": 1,
+    "default_provider": None,
     "defaults": {
         "provider": "serper",
         "max_results": 5
@@ -345,11 +347,91 @@ DEFAULT_CONFIG = {
 }
 
 
+def _deepcopy_default_config() -> Dict[str, Any]:
+    return json.loads(json.dumps(DEFAULT_CONFIG))
+
+
+_ROUTING_PROVIDER_NAMES = {"tavily", "linkup", "querit", "exa", "firecrawl", "perplexity", "brave", "serper", "you", "searxng"}
+
+
+def _normalize_routing_provider_config(provider: str) -> str:
+    normalized = (provider or "").strip().lower()
+    if normalized == "kilo-perplexity":
+        normalized = "perplexity"
+    if normalized not in _ROUTING_PROVIDER_NAMES:
+        raise ValueError(f"unknown routing provider: {provider}")
+    return normalized
+
+
+def _normalize_routing_provider_list_config(value: Any) -> List[str]:
+    if isinstance(value, str):
+        raw_values = [item.strip() for item in value.split(",")]
+    elif isinstance(value, list):
+        raw_values = [str(item).strip() for item in value]
+    else:
+        raise ValueError("provider list must be a string or list")
+    providers = []
+    seen = set()
+    for raw in raw_values:
+        if not raw:
+            continue
+        provider = _normalize_routing_provider_config(raw)
+        if provider in seen:
+            continue
+        seen.add(provider)
+        providers.append(provider)
+    if not providers:
+        raise ValueError("provider list cannot be empty")
+    return providers
+
+
+def _validate_runtime_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    auto = config.get("auto_routing", {})
+    if not isinstance(auto, dict):
+        raise ValueError("auto_routing must be an object")
+    if config.get("default_provider"):
+        config["default_provider"] = _normalize_routing_provider_config(str(config["default_provider"]))
+    if auto.get("fallback_provider"):
+        auto["fallback_provider"] = _normalize_routing_provider_config(str(auto["fallback_provider"]))
+    if auto.get("provider_priority"):
+        auto["provider_priority"] = _normalize_routing_provider_list_config(auto["provider_priority"])
+    if "disabled_providers" in auto:
+        disabled = auto.get("disabled_providers") or []
+        if disabled:
+            auto["disabled_providers"] = _normalize_routing_provider_list_config(disabled)
+        else:
+            auto["disabled_providers"] = []
+    if "confidence_threshold" in auto:
+        threshold = float(auto["confidence_threshold"])
+        if threshold < 0.0 or threshold > 1.0:
+            raise ValueError("confidence_threshold must be between 0.0 and 1.0")
+        auto["confidence_threshold"] = threshold
+    if config.get("default_provider") and config["default_provider"] in set(auto.get("disabled_providers", [])):
+        raise ValueError("default_provider cannot be disabled")
+    config["auto_routing"] = auto
+    return config
+
+
+def _quarantine_runtime_config(config_path: Path, reason: str) -> None:
+    broken = config_path.with_name(config_path.name + f".broken-{int(time.time())}")
+    try:
+        config_path.rename(broken)
+        print(json.dumps({
+            "warning": f"Invalid config moved to {broken}: {reason}",
+            "using": "default configuration",
+        }), file=sys.stderr)
+    except OSError as exc:
+        print(json.dumps({
+            "warning": f"Invalid config could not be moved: {exc}; reason: {reason}",
+            "using": "default configuration",
+        }), file=sys.stderr)
+
+
 def load_config() -> Dict[str, Any]:
     """Load configuration from config.json if it exists, with defaults."""
-    config = DEFAULT_CONFIG.copy()
-    config_path = Path(__file__).parent.parent / "config.json"
-    
+    config = _deepcopy_default_config()
+    config_path = Path(os.environ.get("WEB_SEARCH_PLUS_CONFIG") or (Path(__file__).parent.parent / "config.json"))
+
     if config_path.exists():
         try:
             with open(config_path) as f:
@@ -359,12 +441,11 @@ def load_config() -> Dict[str, Any]:
                         config[key] = {**config.get(key, {}), **value}
                     else:
                         config[key] = value
-        except (json.JSONDecodeError, IOError) as e:
-            print(json.dumps({
-                "warning": f"Could not load config.json: {e}",
-                "using": "default configuration"
-            }), file=sys.stderr)
-    
+            config = _validate_runtime_config(config)
+        except (json.JSONDecodeError, IOError, ValueError, TypeError) as e:
+            _quarantine_runtime_config(config_path, str(e))
+            config = _deepcopy_default_config()
+
     return config
 
 
@@ -1387,6 +1468,28 @@ def auto_route_provider(query: str, config: Dict[str, Any]) -> Dict[str, Any]:
     Intelligently route query to the best provider.
     Returns detailed routing decision with confidence.
     """
+    auto_config = config.get("auto_routing", DEFAULT_CONFIG["auto_routing"])
+    if auto_config.get("enabled", True) is False:
+        default_provider = config.get("default_provider")
+        if default_provider:
+            return {
+                "provider": default_provider,
+                "confidence": 1.0,
+                "confidence_level": "high",
+                "reason": "auto_routing_disabled_default_provider",
+                "scores": {default_provider: 1.0},
+                "top_signals": [],
+                "auto_routed": False,
+            }
+        return {
+            "provider": None,
+            "confidence": 0.0,
+            "confidence_level": "low",
+            "reason": "auto_routing_disabled_no_default_provider",
+            "scores": {},
+            "top_signals": [],
+            "auto_routed": False,
+        }
     analyzer = QueryAnalyzer(config)
     return analyzer.route(query)
 
@@ -3697,13 +3800,21 @@ Full docs: See README.md and SKILL.md
     provider_priority = auto_config.get("provider_priority", ["tavily", "linkup", "querit", "exa", "firecrawl", "perplexity", "brave", "serper", "you", "searxng"])
     disabled_providers = auto_config.get("disabled_providers", [])
 
-    # Start with the selected provider, then try others in priority order
-    # Only include providers that have a configured API key (except the primary,
-    # which gets a clear error if unconfigured and no fallback succeeds)
-    providers_to_try = [provider]
-    for p in provider_priority:
-        if p not in providers_to_try and p not in disabled_providers and get_api_key(p, config):
-            providers_to_try.append(p)
+    # Start with the selected provider, then try others in priority order.
+    # Fixed-provider mode is intentionally strict: if auto-routing is disabled
+    # and the saved default was selected via provider=auto, do not silently
+    # fall back to other providers. Users who want fallback should keep
+    # auto-routing enabled and tune priority/fallback instead.
+    fixed_provider_mode = (
+        auto_config.get("enabled", True) is False
+        and provider == config.get("default_provider")
+        and (args.provider == "auto" or (args.provider is None and not args.similar_url))
+    )
+    providers_to_try = [provider] if provider else []
+    if not fixed_provider_mode:
+        for p in provider_priority:
+            if p not in providers_to_try and p not in disabled_providers and get_api_key(p, config):
+                providers_to_try.append(p)
 
     # Skip providers currently in cooldown
     eligible_providers = []

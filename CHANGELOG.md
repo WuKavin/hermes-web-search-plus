@@ -1,5 +1,21 @@
 # Changelog
 
+## [Unreleased]
+
+### ✨ Added
+- Added provider-behavior onboarding commands under `setup.py config` so users can choose fixed-provider mode, re-enable auto-routing, set routing priority, set fallback provider, disable/enable providers, tune confidence threshold, and reset config with backup.
+- Added JSON status output that reports configured provider capabilities plus routing preferences without printing secrets.
+- Added `--config-path` and `WEB_SEARCH_PLUS_CONFIG` support for isolated tests and non-default behavior config locations.
+- Added setup-time routing flags (`--routing`, `--default-provider`, `--provider-priority`, `--disable-providers`, `--fallback-provider`, `--confidence-threshold`) so first-run onboarding can configure keys and preferences together.
+
+### 🔧 Improved
+- `--provider auto` now respects persisted fixed-provider mode when auto-routing is disabled.
+- Corrupt behavior config files are moved aside safely and replaced with defaults instead of crashing onboarding.
+- Routing config writes are atomic; reset creates timestamped backups.
+
+### 🧪 Tests
+- Expanded onboarding coverage to 40 tests, including config commands, dry-runs, corrupt config recovery in both setup and runtime paths, no-secret leak checks, fixed-provider routing behavior, and Kilo/Perplexity alias normalization.
+
 ## [v1.8.1] — 2026-05-09
 
 ### 🔧 Changed
