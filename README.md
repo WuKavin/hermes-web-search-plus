@@ -1,6 +1,10 @@
 # web-search-plus — Hermes Plugin
 
 <p align="center">
+  <img src="docs/assets/web-search-plus-logo.png" alt="web search plus logo" width="180">
+</p>
+
+<p align="center">
   <img src="docs/assets/web-search-plus-github-hero.jpg" alt="Hermes Web Search Plus feature overview showing search, extraction, answer beta, onboarding, and supported providers" width="100%">
 </p>
 
