@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Web Search Plus — Unified Multi-Provider Search and Extraction with Intelligent Auto-Routing
-Version: 1.9.1
+Version: 1.9.2
 Supports search providers: Serper (Google), Brave Search, Tavily, Querit,
 Linkup, Exa, Firecrawl, Perplexity, You.com, SearXNG.
 Supports extract providers: Firecrawl, Linkup, Tavily, Exa, You.com.
@@ -2773,7 +2773,7 @@ def extract_you(
     return {"provider": "you", "results": results}
 
 
-EXTRACT_PROVIDER_PRIORITY = ["firecrawl", "linkup", "tavily", "exa", "you"]
+EXTRACT_PROVIDER_PRIORITY = ["firecrawl", "linkup", "exa", "tavily", "you"]
 
 
 def extract_plus(

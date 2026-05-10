@@ -169,6 +169,19 @@ class ExtractPlusCoreTests(unittest.TestCase):
         self.assertEqual(result["provider"], "exa")
         mock_exa.assert_called_once()
 
+    def test_extract_provider_priority_keeps_exa_before_tavily(self):
+        self.assertEqual(search.EXTRACT_PROVIDER_PRIORITY, ["firecrawl", "linkup", "exa", "tavily", "you"])
+
+    def test_extract_plus_auto_prefers_exa_over_tavily_when_primary_keys_absent(self):
+        with mock.patch.dict(os.environ, {"EXA_API_KEY": "exa-test", "TAVILY_API_KEY": "tvly-test"}, clear=True):
+            with mock.patch("search.extract_exa", return_value={"provider": "exa", "results": []}) as mock_exa:
+                with mock.patch("search.extract_tavily", return_value={"provider": "tavily", "results": []}) as mock_tavily:
+                    result = search.extract_plus(["https://example.com"], provider="auto")
+
+        self.assertEqual(result["provider"], "exa")
+        mock_exa.assert_called_once()
+        mock_tavily.assert_not_called()
+
     def test_extract_firecrawl_include_images_parses_markdown_and_og_image(self):
         fake_response = {
             "success": True,

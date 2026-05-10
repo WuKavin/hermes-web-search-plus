@@ -10,7 +10,7 @@
   <img alt="Hermes Plugin" src="https://img.shields.io/badge/Hermes-plugin-a78bfa.svg">
 </p>
 
-**Web search, extraction, and optional cited answers for Hermes — bring any one of 10 provider options and the plugin unlocks the tools your keys can actually support.** Linkup is preferred for extraction, but not required; search-only setups still work and degrade honestly.
+**Web search, extraction, and optional cited answers for Hermes — bring any one of 10 provider options and the plugin unlocks the tools your keys can actually support.** `web_extract_plus(provider="auto")` defaults to Firecrawl-first extraction for robust scraping; Linkup remains the cheap/citation-friendly answer-extraction path when available.
 
 `web-search-plus` adds three Hermes tools:
 
@@ -87,7 +87,7 @@ Presets:
 - `starter` — Tavily + Linkup + Brave; best first-run setup.
 - `lean` — Tavily + Linkup; cheapest useful search + extraction pairing.
 - `search` — Tavily + Brave + Serper; broad search coverage.
-- `extract` — Linkup + Firecrawl + Tavily; extraction-heavy setup.
+- `extract` — Firecrawl + Linkup + Exa + Tavily; extraction-heavy setup.
 - `all` — prompt for every supported provider.
 
 The CLI never prints secret values. It writes keys into the active Hermes `.env` file, then reminds you to restart Hermes or run `/reset` so the tools re-register.
@@ -187,7 +187,7 @@ Defaults are intentionally conservative:
 - `quick` mode asks for 3 sources and extracts up to 2 URLs.
 - `deep` mode asks for 6 sources and uses research mode, with extraction still hard-capped at 5 URLs.
 - `freshness="none"` is the default to avoid over-triggering recency on words like “current” or “aktuell”. Set `freshness="auto"`, `day`, `week`, `month`, or `year` explicitly when recency should shape search.
-- Linkup is preferred for extraction; other extraction providers are used through the normal fallback chain.
+- `web_answer_plus` still prefers Linkup for answer extraction when available; direct `web_extract_plus(provider="auto")` uses the extraction chain below.
 - If no extraction provider is configured, answers are snippet-backed and carry an explicit warning.
 
 A real failure case from dogfooding: `Österreich Startelf WM 2026 Qualifikation aktuelle Aufstellung` is better handled by `web_search_plus`; answer synthesis can drift toward schedule or wrong-sport sources if recency is pushed too hard.
@@ -253,7 +253,7 @@ web_extract_plus(urls=["https://docs.linkup.so"], provider="linkup", render_js=F
 # → Linkup fetch endpoint
 ```
 
-Auto extraction currently tries Firecrawl, then Linkup, Tavily, Exa, and You.com when keys are available.
+Auto extraction currently tries Firecrawl, then Linkup, Exa, Tavily, and You.com when keys are available. Firecrawl is the default robust scraper; Linkup is the cheap/citation-friendly fallback; Exa is preferred before Tavily for academic/research-style pages.
 
 Parameters:
 
@@ -298,7 +298,7 @@ BRAVE_API_KEY=***         # https://brave.com/search/api/
 TAVILY_API_KEY=***        # https://tavily.com — search + extraction
 EXA_API_KEY=***           # https://exa.ai — search + extraction
 QUERIT_API_KEY=***        # https://querit.ai
-LINKUP_API_KEY=***        # https://linkup.so — search + preferred extraction
+LINKUP_API_KEY=***        # https://linkup.so — search + cheap/citation-friendly extraction
 FIRECRAWL_API_KEY=***     # https://firecrawl.dev — search + extraction
 PERPLEXITY_API_KEY=***    # https://perplexity.ai/settings/api
 YOU_API_KEY=***           # https://api.you.com — search + extraction

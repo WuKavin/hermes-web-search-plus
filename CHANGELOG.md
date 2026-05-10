@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## [v1.9.2] — 2026-05-10
+
+### 🔧 Changed
+- `web_extract_plus(provider="auto")` now documents and tests the intended extraction fallback order: Firecrawl → Linkup → Exa → Tavily → You.com. Firecrawl remains the robust default scraper, Linkup stays the cheap/citation-friendly fallback, and Exa is tried before Tavily for research-style pages.
+
+### 🧪 Tests
+- Added regression coverage for the direct extraction provider priority and Exa-before-Tavily fallback behavior.
+
 ## [v1.9.1] — 2026-05-09
 
 ### 🐛 Fixed

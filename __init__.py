@@ -1,11 +1,11 @@
 """
-web-search-plus — Hermes Plugin v1.9.1
+web-search-plus — Hermes Plugin v1.9.2
 Multi-provider web search, URL extraction, quality reports, and opt-in research mode.
 Ported from robbyczgw-cla/web-search-plus-plugin (OpenClaw) to Hermes Plugin API.
 """
 from __future__ import annotations
 
-__version__ = "1.9.1"
+__version__ = "1.9.2"
 
 import argparse
 import getpass
@@ -208,8 +208,8 @@ def _provider_config_status(env: Optional[Mapping[str, str]] = None) -> Dict[str
     No single provider key is globally required. Search, extraction, and answer
     quality are capability-based: one search provider enables search/snippet
     answers; one extraction-capable provider enables URL extraction and fuller
-    cited answers. Linkup is preferred for answer extraction when available, but
-    it is not a hard requirement.
+    cited answers. `web_extract_plus(provider="auto")` defaults to Firecrawl first
+    for robust scraping; Linkup remains preferred for answer extraction when available.
     """
     env = env if env is not None else os.environ
     providers: Dict[str, Dict[str, Any]] = {}
