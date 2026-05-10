@@ -1,7 +1,7 @@
 # web-search-plus — Hermes Plugin
 
 <p align="center">
-  <img src="docs/assets/web-search-plus-v181-release.png" alt="Hermes web-search-plus v1.8.1 release graphic showing search, extraction, optional answer beta, onboarding, and supported providers" width="100%">
+  <img src="docs/assets/web-search-plus-github-hero.png" alt="Hermes Web Search Plus hero graphic showing intent-aware search, extraction, research, answer grounding, provider routing, and quality reports" width="100%">
 </p>
 
 <p align="center">
