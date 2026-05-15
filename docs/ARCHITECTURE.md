@@ -40,7 +40,7 @@ Each provider adapter normalizes provider-specific request and response details 
 
 Provider capability classes:
 
-- Search-only: Brave, Serper, SerpBase, Querit, Perplexity, Kilo Perplexity, SearXNG.
+- Search-only: Brave, Serper, Perplexity, Kilo Perplexity, SearXNG, SerpBase, Querit. SerpBase and Querit are listed last because they default to `auto_allow=false` and are explicit/fallback-only unless users opt in.
 - Search and extraction: Tavily, Exa, Linkup, Firecrawl, You.com.
 - Answer-style search: Perplexity and Kilo Perplexity return direct-answer style search results, but are still exposed through the search interface.
 

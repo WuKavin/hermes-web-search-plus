@@ -147,7 +147,7 @@ Notes:
 
 | Capability | Unlocks | Configure at least one of |
 |---|---|---|
-| Search | `web_search_plus`, snippet-backed `web_answer_plus` | Brave, Serper, SerpBase, Tavily, Exa, Querit, Linkup, Firecrawl, Perplexity, Kilo Perplexity, You.com, or SearXNG |
+| Search | `web_search_plus`, snippet-backed `web_answer_plus` | Brave, Serper, Tavily, Exa, Linkup, Firecrawl, Perplexity, Kilo Perplexity, You.com, SearXNG, SerpBase, or Querit |
 | Extraction | `web_extract_plus`, fuller `web_answer_plus` citations | Linkup, Firecrawl, Tavily, Exa, or You.com |
 | Best starter | Search + extraction + broad fallback | Tavily + Linkup + optional Brave |
 
@@ -246,7 +246,7 @@ Parameters:
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `query` | string | **required** | Search query |
-| `provider` | string | `"auto"` | `auto`, `serper`, `serpbase`, `brave`, `tavily`, `exa`, `querit`, `linkup`, `firecrawl`, `perplexity`, `kilo-perplexity`, `you`, `searxng` |
+| `provider` | string | `"auto"` | `auto`, `serper`, `brave`, `tavily`, `exa`, `linkup`, `firecrawl`, `perplexity`, `kilo-perplexity`, `you`, `searxng`, `serpbase`, `querit` |
 | `depth` | string | `"normal"` | Exa only: `normal`, `deep`, `deep-reasoning` |
 | `count` | integer | `5` | Results, 1–20 |
 | `time_range` | string | — | `day`, `week`, `month`, `year` |
@@ -289,18 +289,18 @@ Parameters:
 |---|---:|---:|---|
 | Brave | ✅ | — | General-purpose independent web index |
 | Serper | ✅ | — | Google-like SERP, news, shopping, local facts |
-| SerpBase | ✅ | — | Cheap Google-like SERP fallback; explicit/fallback-only by default |
 | Tavily | ✅ | ✅ | Long-form research and content-heavy queries |
 | Exa | ✅ | ✅ | Semantic discovery and similarity search |
-| Querit | ✅ | — | Multilingual and real-time queries |
 | Linkup | ✅ | ✅ | Source-backed grounding, citations, RAG-ready retrieval |
 | Firecrawl | ✅ | ✅ | Web search with scrape-ready result content |
 | Perplexity | ✅ | — | Native Perplexity direct answer-style search |
 | Kilo Perplexity | ✅ | — | Perplexity through Kilo gateway (`kilo-perplexity`) |
 | You.com | ✅ | ✅ | LLM-ready real-time snippets and content |
 | SearXNG | ✅ | — | Privacy-focused self-hosted metasearch |
+| SerpBase | ✅ | — | Cheap Google-like SERP fallback; explicit/fallback-only by default (`auto_allow=false`) |
+| Querit | ✅ | — | Multilingual and real-time queries; explicit/fallback-only by default (`auto_allow=false`) |
 
-Auto-routing is rule-based on query signals such as recency, product intent, research language, and semantic-discovery patterns. Brave and Serper share generic web-search intents; when they tie, deterministic per-query tie-breaking keeps the same query reproducible while distributing ties across both providers. SerpBase is intentionally `auto_allow=false` by default: configure `SERPBASE_API_KEY` to call `provider="serpbase"` explicitly, or opt it into automatic routing with `setup.py config set-auto-allow serpbase on`.
+Auto-routing is rule-based on query signals such as recency, product intent, research language, and semantic-discovery patterns. Brave and Serper share generic web-search intents; when they tie, deterministic per-query tie-breaking keeps the same query reproducible while distributing ties across both providers. SerpBase and Querit are intentionally listed last because both default to `auto_allow=false`: configure their keys to call them explicitly, or opt them into automatic routing with `setup.py config set-auto-allow <provider> on`.
 
 ---
 
@@ -311,16 +311,16 @@ All provider keys are optional at install time. Configure only what you use:
 ```bash
 # Search-capable providers
 SERPER_API_KEY=***        # https://serper.dev
-SERPBASE_API_KEY=***      # https://www.serpbase.dev — explicit/fallback-only Google-like SERP search
 BRAVE_API_KEY=***         # https://brave.com/search/api/
 TAVILY_API_KEY=***        # https://tavily.com — search + extraction
 EXA_API_KEY=***           # https://exa.ai — search + extraction
-QUERIT_API_KEY=***        # https://querit.ai
 LINKUP_API_KEY=***        # https://linkup.so — search + cheap/citation-friendly extraction
 FIRECRAWL_API_KEY=***     # https://firecrawl.dev — search + extraction
 PERPLEXITY_API_KEY=***    # https://perplexity.ai/settings/api
 YOU_API_KEY=***           # https://api.you.com — search + extraction
 SEARXNG_INSTANCE_URL=https://your-instance.example.com
+SERPBASE_API_KEY=***      # https://www.serpbase.dev — explicit/fallback-only Google-like SERP search
+QUERIT_API_KEY=***        # https://querit.ai — explicit/fallback-only by default
 
 # Kilo gateway alternate provider (`provider="kilo-perplexity"`)
 KILOCODE_API_KEY=***

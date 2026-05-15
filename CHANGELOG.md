@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### 🔧 Changed
+- Docs now list SerpBase and Querit last in general provider lists because both default to `auto_allow=false`.
+
 ## [v1.10.0] — 2026-05-15
 
 ### ✨ Added

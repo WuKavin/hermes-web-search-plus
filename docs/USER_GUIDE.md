@@ -62,7 +62,7 @@ Presets:
 - `extract`: Firecrawl + Linkup + Exa + Tavily. Extraction-heavy setup.
 - `all`: prompt for every supported provider.
 
-Search-capable providers include Brave, Serper, SerpBase, Tavily, Exa, Querit, Linkup, Firecrawl, Perplexity, Kilo Perplexity, You.com, and SearXNG. Extraction-capable providers are Linkup, Firecrawl, Tavily, Exa, and You.com.
+Search-capable providers include Brave, Serper, Tavily, Exa, Linkup, Firecrawl, Perplexity, Kilo Perplexity, You.com, SearXNG, SerpBase, and Querit. Extraction-capable providers are Linkup, Firecrawl, Tavily, Exa, and You.com.
 
 ## Routing preferences
 
@@ -143,26 +143,29 @@ Example pattern:
 
 Read that as: SerpBase has a key but is explicit-only, Brave is temporarily cooled down, and Serper won among eligible providers. If you want SerpBase to participate in automatic routing, opt in with `set-auto-allow serpbase on`; if you want Brave retried immediately, wait for cooldown or clear local provider health state in your cache directory.
 
-## Explicit opt-in providers and SerpBase
+## Explicit opt-in providers: SerpBase and Querit
 
 Some providers can be configured for explicit use without being selected automatically. That is what `auto_allow` controls.
 
-SerpBase defaults to `auto_allow=false`. Setting `SERPBASE_API_KEY` makes explicit calls work:
+SerpBase and Querit default to `auto_allow=false`. Setting their keys makes explicit calls work:
 
 ```python
 web_search_plus(query="best DAC reviews", provider="serpbase")
+web_search_plus(query="aktuelle KI-News Deutschland", provider="querit")
 ```
 
-It does not make SerpBase eligible for automatic routing or fallback until you opt in:
+That does not make either provider eligible for automatic routing or fallback until you opt in:
 
 ```bash
 python ~/.hermes/plugins/web-search-plus/setup.py config set-auto-allow serpbase on
+python ~/.hermes/plugins/web-search-plus/setup.py config set-auto-allow querit on
 ```
 
 Turn automatic use back off:
 
 ```bash
 python ~/.hermes/plugins/web-search-plus/setup.py config set-auto-allow serpbase off
+python ~/.hermes/plugins/web-search-plus/setup.py config set-auto-allow querit off
 ```
 
 This pattern avoids silent cost or coverage surprises. Use it for providers whose pricing, maturity, or result style you want to test before letting `provider="auto"` choose them.
@@ -182,7 +185,7 @@ web_search_plus(query="turntable reviews under 1000", mode="research", research_
 
 Important parameters:
 
-- `provider`: `auto`, or a concrete provider such as `brave`, `serper`, `serpbase`, `tavily`, `linkup`, `exa`, `perplexity`, `kilo-perplexity`, `you`, or `searxng`.
+- `provider`: `auto`, or a concrete provider such as `brave`, `serper`, `tavily`, `linkup`, `exa`, `perplexity`, `kilo-perplexity`, `you`, `searxng`, `serpbase`, or `querit`. SerpBase and Querit are listed last because they default to `auto_allow=false`.
 - `count`: result count, from 1 to 20.
 - `time_range`: `day`, `week`, `month`, or `year` where supported.
 - `include_domains` / `exclude_domains`: provider-dependent domain filters.
