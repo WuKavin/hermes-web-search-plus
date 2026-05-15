@@ -20,9 +20,11 @@ Turn it back off with:
 python ~/.hermes/plugins/web-search-plus/setup.py config set-auto-allow serpbase off
 ```
 
-## Which provider gets picked when multiple providers are configured?
+## Which provider gets picked by Routing v2 when multiple providers are configured?
 
-If routing is enabled, the query analyzer scores providers by query signals such as current-info intent, product/local intent, research language, direct-answer intent, semantic-discovery intent, and privacy intent. The router then filters out unavailable, disabled, or `auto_allow=false` providers and chooses the best eligible provider. Ties are deterministic per query.
+If Routing v2 is enabled, the query analyzer scores providers by query signals such as current-info intent, product/local intent, research language, direct-answer intent, semantic-discovery intent, privacy intent, language/script hints, and class-specific benchmark rules. The router then filters out unavailable, disabled, or `auto_allow=false` providers and chooses the best eligible provider. Ties are deterministic per query.
+
+The default auto-search pool is conservative: You.com, Serper, Exa, Firecrawl, Tavily, and Linkup. Brave, SerpBase, Querit, native Perplexity, and Kilo Perplexity default to explicit/guarded use; Kilo Perplexity is intended for answer/research mode rather than fast search auto-routing.
 
 For the exact flow, see [Architecture](ARCHITECTURE.md#routing-engine).
 
@@ -31,13 +33,13 @@ For the exact flow, see [Architecture](ARCHITECTURE.md#routing-engine).
 Per call:
 
 ```python
-web_search_plus(query="Hermes Agent docs", provider="brave")
+web_search_plus(query="Hermes Agent docs", provider="you")
 ```
 
 Persistently:
 
 ```bash
-python ~/.hermes/plugins/web-search-plus/setup.py config set-default brave
+python ~/.hermes/plugins/web-search-plus/setup.py config set-default you
 ```
 
 Re-enable auto-routing later:
@@ -76,7 +78,7 @@ python ~/.hermes/plugins/web-search-plus/setup.py status
 Also verify that the key was written to the environment file Hermes actually uses. The setup helper supports explicit targeting:
 
 ```bash
-python ~/.hermes/plugins/web-search-plus/setup.py setup brave --env-path ~/.hermes/.env
+python ~/.hermes/plugins/web-search-plus/setup.py setup you --env-path ~/.hermes/.env
 ```
 
 ## How do I cap spend?
@@ -110,8 +112,8 @@ Different SERP APIs can have different freshness, ranking, localization, persona
 Yes. Configure one search-capable provider and pin it if you want predictable behavior:
 
 ```bash
-python ~/.hermes/plugins/web-search-plus/setup.py setup brave
-python ~/.hermes/plugins/web-search-plus/setup.py config set-default brave
+python ~/.hermes/plugins/web-search-plus/setup.py setup you
+python ~/.hermes/plugins/web-search-plus/setup.py config set-default you
 ```
 
 Extraction requires an extraction-capable provider such as Linkup, Firecrawl, Tavily, Exa, or You.com.
