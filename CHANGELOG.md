@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [v1.10.0] — 2026-05-15
+
 ### ✨ Added
 - Added SerpBase as a search provider using `SERPBASE_API_KEY`, available via `provider="serpbase"`.
 - Added onboarding/config support for `auto_allow`, including `setup.py config set-auto-allow <provider> on|off` so experimental or fallback providers can remain explicit-only.
