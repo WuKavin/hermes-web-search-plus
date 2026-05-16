@@ -1,8 +1,5 @@
 # web-search-plus — Hermes Plugin
 
-<p align="center">
-  <img src="docs/assets/web-search-plus-logo.png" alt="web search plus logo" width="180">
-</p>
 
 <p align="center">
   <img src="docs/assets/web-search-plus-v21-hero.png" alt="Hermes web-search-plus v2.1 hero showing the two-tool surface, Routing v2, Tavily-first extraction, and supported providers" width="100%">
