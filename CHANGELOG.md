@@ -6,8 +6,11 @@
 - Removed `web_answer_plus` from the registered Hermes tool surface and plugin manifest. The plugin now keeps one job: search plus extraction, without a separate answer-synthesis layer.
 - Removed runtime answer-mode metadata (`answer_mode_recommended`) and onboarding answer capability reporting.
 
+### ✨ Added
+- Added Parallel as the 13th search provider and 6th extraction provider using `PARALLEL_API_KEY`. Parallel is available for explicit calls and remains guarded from auto-routing by default via `auto_allow=false`.
+
 ### 🔧 Changed
-- `web_extract_plus(provider="auto")` now uses the benchmark-backed extraction fallback order Tavily → Exa → Linkup → Firecrawl → You.com. Tavily becomes the fast reliable default head; Firecrawl remains the robust scraper safety net rather than the first call.
+- `web_extract_plus(provider="auto")` now uses the benchmark-backed extraction fallback order Tavily → Exa → Linkup → Parallel → Firecrawl → You.com. Tavily becomes the fast reliable default head; Parallel provides a fast excerpt-rich docs fallback; Firecrawl remains the robust scraper safety net rather than the first call.
 
 ### 📚 Docs
 - Updated README, User Guide, FAQ, Architecture, and plugin manifest to describe the two-tool surface: `web_search_plus` and `web_extract_plus`.
@@ -17,7 +20,7 @@
 ### 🚀 Major: Routing v2
 - Replaced naive provider-priority auto-routing with benchmarked, class-aware Routing v2 based on the 25-query provider matrix and qualitative provider review.
 - You.com, Serper, Exa, Firecrawl, Tavily, and Linkup now form the conservative default search pool.
-- Brave, SerpBase, Querit, native Perplexity, and Kilo Perplexity default to explicit/guarded use via `auto_allow=false`; existing configs inherit these guarded defaults unless users explicitly opt providers back in.
+- Brave, SerpBase, Querit, Parallel, native Perplexity, and Kilo Perplexity default to explicit/guarded use via `auto_allow=false`; existing configs inherit these guarded defaults unless users explicitly opt providers back in.
 - Added class-aware routing boosts for multilingual current queries, AT/local shopping, GitHub/docs, package/API docs, arXiv/academic queries, Reddit/community searches, CVE/security advisories, official/regulatory queries, finance/IR, weather/local factual lookups, OSS discovery, and answer/synthesis prompts.
 - Search auto-routing now flags answer/synthesis prompts with `answer_mode_recommended` instead of selecting slow answer-only providers such as Kilo Perplexity.
 - Routing diagnostics now expose `language_hint`, `routing_class`, and `routing_policy`.
