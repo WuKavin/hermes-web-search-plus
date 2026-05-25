@@ -1,5 +1,15 @@
 # Changelog
 
+## [v2.2.1] — 2026-05-25
+
+### 🔧 Changed
+- Split the large `search.py` implementation into focused cache, config, HTTP client, provider-health, provider, quality, research, routing, and extraction modules while keeping the public Hermes tool surface backward-compatible.
+- Routed provider search/extraction calls through the new module boundaries without changing configured provider behavior.
+
+### 🧪 Tests
+- Added provider/extract contract tests plus HTTP client module coverage to lock the refactor down.
+- Verified the full plugin test suite after syncing the refactor stack.
+
 ## [v2.2.0] — 2026-05-19
 
 ### ✨ Added
