@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### 🔧 Improved
+- Quality reports now expose transparent authority signals for canonical-source routing classes, including canonical domain hits, demoted domain hits, and whether the top result is a primary source.
+
 ### 🧪 Tests
 - Added offline golden snapshot quality checks for canonical source presence, blocked mirror domains, duplicate counts, and extracted-content substance without live provider calls.
 
