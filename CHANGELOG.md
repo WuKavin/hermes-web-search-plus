@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## [v2.3.0] — 2026-05-29
+
 ### ✨ Added
 - Added the ProviderSpec registry as the central source of truth for provider metadata across setup, config, routing, extraction, doctor diagnostics, and CLI choices.
 
