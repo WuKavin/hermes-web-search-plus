@@ -293,6 +293,8 @@ python3 search.py --query "Hermes Agent latest release" --provider auto --qualit
 python3 search.py --query "Hermes Agent latest release" --provider brave --max-results 2 --compact
 ```
 
+Compatibility shims in `search.py` intentionally preserve legacy imports and monkeypatch seams while the modular split settles. The public shim policy is available via `get_compatibility_shim_policy()` and must keep wrappers in place until the ProviderSpec registry has stabilized for a documented minor release window.
+
 Golden snapshot quality checks are offline/replayable and safe for CI. They assert source-quality expectations such as canonical-domain presence, blocked mirror domains, duplicate counts, and extracted-content substance without making live provider calls:
 
 ```bash
