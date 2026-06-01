@@ -67,6 +67,18 @@ Notes:
 
 ---
 
+## Updating
+
+Update an existing install with the Hermes plugin manager:
+
+```bash
+hermes plugins update web-search-plus
+```
+
+Restart Hermes, or run `/reset` in an existing session, so the updated plugin code and tool schemas are reloaded.
+
+---
+
 ## Documentation
 
 - [User Guide](docs/USER_GUIDE.md) — detailed setup, provider tuning, routing, extraction, reliability, and cost controls.
