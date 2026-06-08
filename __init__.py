@@ -9,6 +9,7 @@ __version__ = "2.3.1"
 
 import argparse
 import getpass
+import importlib.util
 import json
 import logging
 import os
@@ -16,10 +17,13 @@ import shutil
 import subprocess
 import tempfile
 import sys
+import threading
 import time
 import webbrowser
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeout
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional
 
 try:  # Package load path used by Hermes plugin discovery.
     from .provider_registry import (
@@ -815,6 +819,84 @@ def _on_session_start(**kwargs: Any) -> Optional[Dict[str, str]]:
     return hint
 
 
+_search_module: Any = None
+_search_import_failed = False
+_search_import_lock = threading.Lock()
+
+
+def _load_search_module() -> Any:
+    """Load the in-process search engine from this plugin's ``search.py``.
+
+    ``search.py`` still uses flat absolute imports for sibling modules, so the
+    plugin directory must be on ``sys.path`` while it loads. The search module
+    itself is loaded from its exact file path under a private module name instead
+    of ``import search`` so an unrelated global ``search`` module cannot shadow the
+    plugin engine.
+    """
+    global _search_module, _search_import_failed
+    if _search_module is not None:
+        return _search_module
+    if _search_import_failed:
+        return None
+    with _search_import_lock:
+        if _search_module is not None:
+            return _search_module
+        if _search_import_failed:
+            return None
+        plugin_dir = str(Path(__file__).parent)
+        inserted = False
+        if plugin_dir not in sys.path:
+            sys.path.insert(0, plugin_dir)
+            inserted = True
+        try:
+            spec = importlib.util.spec_from_file_location("_wsp_search_engine", _SEARCH_SCRIPT)
+            if spec is None or spec.loader is None:
+                raise ImportError(f"cannot load search engine from {_SEARCH_SCRIPT}")
+            _search = importlib.util.module_from_spec(spec)
+            sys.modules["_wsp_search_engine"] = _search
+            spec.loader.exec_module(_search)
+        except Exception:  # pragma: no cover - defensive: fall back to subprocess
+            sys.modules.pop("_wsp_search_engine", None)
+            logger.exception("web-search-plus: in-process search import failed; using subprocess fallback")
+            _search_import_failed = True
+            return None
+        finally:
+            if inserted:
+                try:
+                    sys.path.remove(plugin_dir)
+                except ValueError:  # pragma: no cover - defensive cleanup
+                    pass
+        _search_module = _search
+        return _search_module
+
+
+def _force_subprocess() -> bool:
+    """Allow operators to opt back into the legacy subprocess path via env."""
+    return _clean_env_value(os.environ.get("WSP_FORCE_SUBPROCESS", "")) is not None
+
+
+def _search_timeout(mode: str, research_time_budget: float, base: int = 75) -> int:
+    """Wall-clock budget for a search call, widened for research mode."""
+    if mode == "research":
+        return max(base, int(research_time_budget) + 15)
+    return base
+
+
+def _call_with_timeout(fn: Callable[[], dict], timeout: int) -> dict:
+    """Run ``fn`` in a worker thread bounded by a wall-clock timeout.
+
+    Mirrors the hard timeout the subprocess used to give us. On timeout we stop
+    waiting (the orphaned worker is bounded by per-provider HTTP timeouts) and
+    raise ``FuturesTimeout`` for the caller to translate into a structured error.
+    """
+    executor = ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(fn)
+    try:
+        return future.result(timeout=timeout)
+    finally:
+        executor.shutdown(wait=False)
+
+
 def _run_search(
     query: str,
     provider: str = "auto",
@@ -830,7 +912,55 @@ def _run_search(
     country: Optional[str] = None,
     subprocess_timeout: int = 75,
 ) -> dict:
-    """Call search.py subprocess and return parsed JSON result."""
+    """Run a search in-process (fast path), falling back to the subprocess engine.
+
+    The in-process path avoids per-call interpreter startup, module re-import, and
+    a JSON round-trip. A thread watchdog preserves the wall-clock timeout the
+    subprocess previously enforced.
+    """
+    timeout = _search_timeout(mode, research_time_budget, subprocess_timeout)
+    search = None if _force_subprocess() else _load_search_module()
+    if search is None:
+        return _run_search_subprocess(
+            query=query, provider=provider, count=count, exa_depth=exa_depth,
+            time_range=time_range, include_domains=include_domains,
+            exclude_domains=exclude_domains, mode=mode, quality_report=quality_report,
+            research_time_budget=research_time_budget, language=language, country=country,
+            subprocess_timeout=timeout,
+        )
+
+    def call() -> dict:
+        return search.run_search_request(
+            query=query, provider=provider, count=count, exa_depth=exa_depth,
+            time_range=time_range, include_domains=include_domains,
+            exclude_domains=exclude_domains, mode=mode, quality_report=quality_report,
+            research_time_budget=research_time_budget, language=language, country=country,
+        )
+
+    try:
+        return _call_with_timeout(call, timeout)
+    except FuturesTimeout:
+        return {"error": f"Search timed out after {timeout}s", "provider": provider, "query": query, "results": []}
+    except Exception as e:
+        return {"error": str(e), "provider": provider, "query": query, "results": []}
+
+
+def _run_search_subprocess(
+    query: str,
+    provider: str = "auto",
+    count: int = 5,
+    exa_depth: str = "normal",
+    time_range: Optional[str] = None,
+    include_domains: Optional[List[str]] = None,
+    exclude_domains: Optional[List[str]] = None,
+    mode: str = "normal",
+    quality_report: bool = False,
+    research_time_budget: float = 55.0,
+    language: Optional[str] = None,
+    country: Optional[str] = None,
+    subprocess_timeout: int = 75,
+) -> dict:
+    """Legacy fallback: call search.py as a subprocess and return parsed JSON."""
     cmd = [
         sys.executable,
         str(_SEARCH_SCRIPT),
@@ -892,7 +1022,40 @@ def _run_extract(
     render_js: bool = False,
     subprocess_timeout: int = 90,
 ) -> dict:
-    """Call search.py extract mode and return parsed JSON result."""
+    """Run URL extraction in-process (fast path), falling back to the subprocess."""
+    search = None if _force_subprocess() else _load_search_module()
+    if search is None:
+        return _run_extract_subprocess(
+            urls, provider=provider, output_format=output_format,
+            include_images=include_images, include_raw_html=include_raw_html,
+            render_js=render_js, subprocess_timeout=subprocess_timeout,
+        )
+
+    def call() -> dict:
+        return search.run_extract_request(
+            urls, provider=provider, output_format=output_format,
+            include_images=include_images, include_raw_html=include_raw_html,
+            render_js=render_js,
+        )
+
+    try:
+        return _call_with_timeout(call, subprocess_timeout)
+    except FuturesTimeout:
+        return {"error": f"Extract timed out after {subprocess_timeout}s", "provider": provider, "results": []}
+    except Exception as e:
+        return {"error": str(e), "provider": provider, "results": []}
+
+
+def _run_extract_subprocess(
+    urls: List[str],
+    provider: str = "auto",
+    output_format: str = "markdown",
+    include_images: bool = False,
+    include_raw_html: bool = False,
+    render_js: bool = False,
+    subprocess_timeout: int = 90,
+) -> dict:
+    """Legacy fallback: call search.py extract mode and return parsed JSON result."""
     cmd = [
         sys.executable,
         str(_SEARCH_SCRIPT),
