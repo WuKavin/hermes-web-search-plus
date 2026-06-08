@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## [v2.4.0] — 2026-06-08
 
 ### ⚡ Performance
 - The Hermes plugin now runs `web_search_plus` and `web_extract_plus` in-process by default instead of spawning a `search.py` subprocess per call, removing interpreter-startup, module re-import, and JSON round-trip overhead on every tool invocation. The legacy subprocess path remains as an automatic fallback (used if the in-process import fails) and can be forced with `WSP_FORCE_SUBPROCESS=1`. A thread watchdog preserves the previous hard wall-clock timeout.
