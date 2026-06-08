@@ -2,22 +2,30 @@
 
 ## [v2.4.0] — 2026-06-08
 
+### Credits
+- #50 by @robbyczgw-cla — in-process `web_search_plus`/`web_extract_plus` execution and parallel research mode.
+- #46 by @robbyczgw-cla — Hermes profile `.env` loading for provider keys.
+- #49 by @wysie — plugin update instructions in the README.
+
 ### ⚡ Performance
-- The Hermes plugin now runs `web_search_plus` and `web_extract_plus` in-process by default instead of spawning a `search.py` subprocess per call, removing interpreter-startup, module re-import, and JSON round-trip overhead on every tool invocation. The legacy subprocess path remains as an automatic fallback (used if the in-process import fails) and can be forced with `WSP_FORCE_SUBPROCESS=1`. A thread watchdog preserves the previous hard wall-clock timeout.
-- Research mode now queries its providers concurrently instead of sequentially, so wall-clock cost tracks the slowest provider rather than the sum of all of them. Result ordering stays deterministic (preserved by submission order) and the time budget still gates which providers launch and whether extraction runs.
+- The Hermes plugin now runs `web_search_plus` and `web_extract_plus` in-process by default instead of spawning a `search.py` subprocess per call, removing interpreter-startup, module re-import, and JSON round-trip overhead on every tool invocation. The legacy subprocess path remains as an automatic fallback (used if the in-process import fails) and can be forced with `WSP_FORCE_SUBPROCESS=1`. A thread watchdog preserves the previous hard wall-clock timeout. (#50)
+- Research mode now queries its providers concurrently instead of sequentially, so wall-clock cost tracks the slowest provider rather than the sum of all of them. Result ordering stays deterministic (preserved by submission order) and the time budget still gates which providers launch and whether extraction runs. (#50)
 
 ### 🐛 Fixed
-- Standalone `search.py`, config helpers, and `setup.py status` now load provider keys from the active Hermes profile `.env` in addition to plugin-local legacy `.env` files, preventing false `missing_api_key` fallbacks when keys live in `~/.hermes/.env`.
+- Standalone `search.py`, config helpers, and `setup.py status` now load provider keys from the active Hermes profile `.env` in addition to plugin-local legacy `.env` files, preventing false `missing_api_key` fallbacks when keys live in `~/.hermes/.env`. (#46)
+
+### 📚 Docs
+- Added README instructions for updating an installed plugin plus reload/reset notes. (#49, thanks @wysie)
 
 ### 🔧 Improved
-- Provider retry backoff now adds bounded random jitter (`RETRY_JITTER_FRACTION`) so concurrent or repeated retries against a recovering provider no longer synchronize into bursts.
-- Provider health read-modify-write is now guarded by a lock so concurrent in-process provider calls (parallel research mode) cannot lose cooldown updates.
+- Provider retry backoff now adds bounded random jitter (`RETRY_JITTER_FRACTION`) so concurrent or repeated retries against a recovering provider no longer synchronize into bursts. (#50)
+- Provider health read-modify-write is now guarded by a lock so concurrent in-process provider calls (parallel research mode) cannot lose cooldown updates. (#50)
 
 ### 🧱 Internal
-- Split `search.py`'s monolithic `main()` into `build_parser()`, the pure `execute_search_request()` pipeline (returns `(payload, exit_code)` without printing or `sys.exit`), and in-process `run_search_request()`/`run_extract_request()` entry points. CLI behaviour and output are unchanged.
+- Split `search.py`'s monolithic `main()` into `build_parser()`, the pure `execute_search_request()` pipeline (returns `(payload, exit_code)` without printing or `sys.exit`), and in-process `run_search_request()`/`run_extract_request()` entry points. CLI behaviour and output are unchanged. (#50)
 
 ### 🧪 Tests
-- Added in-process search coverage (provider config resolution, auto-routing, explicit-provider error dicts, empty-query guard), research-mode out-of-order completion ordering, retry jitter bounds, and subprocess-fallback behaviour.
+- Added in-process search coverage (provider config resolution, auto-routing, explicit-provider error dicts, empty-query guard), research-mode out-of-order completion ordering, retry jitter bounds, and subprocess-fallback behaviour. (#46, #50)
 
 ## [v2.3.1] — 2026-05-31
 
