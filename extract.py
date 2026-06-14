@@ -16,6 +16,7 @@ from providers import (
     extract_parallel,
     extract_tavily,
     extract_you,
+    extract_anysearch,
 )
 from provider_registry import EXTRACT_PROVIDER_IDS
 
@@ -83,6 +84,13 @@ def extract_plus(
                         client_model=parallel.get("client_model"),
                         max_chars_total=int(parallel.get("max_chars_total", 12000)),
                         max_chars_per_result=int(parallel.get("max_chars_per_result", 6000)),
+                    )
+                if prov == "anysearch":
+                    an = config.get("anysearch", {})
+                    return extract_anysearch(
+                        urls, key, output_format, include_images, include_raw_html, render_js,
+                        api_url=an.get("mcp_url", "https://api.anysearch.com/mcp"),
+                        timeout=int(an.get("extract_timeout", an.get("timeout", 60))),
                     )
                 you = config.get("you", {})
                 return extract_you(urls, key, output_format, include_images, include_raw_html, render_js, api_url=you.get("contents_url", "https://ydc-index.io/v1/contents"), timeout=int(you.get("timeout", 30)))

@@ -58,6 +58,18 @@ _PROVIDER_SPECS = (
         upstream_capabilities=("images", "news", "videos", "maps_search", "maps_detail"),
     ),
     ProviderSpec(
+        provider="anysearch",
+        env_var="ANYSEARCH_API_KEY",
+        display_name="AnySearch",
+        description="AI-native vertical search with 22 domains (code, academic, legal, finance). Free 1,000/day anonymous tier.",
+        config_section="anysearch",
+        supports_search=True,
+        supports_extract=True,
+        capability_labels=("search", "extract", "vertical"),
+        free_tier="1,000 free searches/day (anonymous) + paid tier with API key",
+        signup_url="https://anysearch.com/console/api-keys",
+    ),
+    ProviderSpec(
         provider="brave",
         env_var="BRAVE_API_KEY",
         display_name="Brave Search",
@@ -199,13 +211,14 @@ _PROVIDER_SPECS = (
 
 PROVIDER_SPECS: Dict[str, ProviderSpec] = {spec.provider: spec for spec in _PROVIDER_SPECS}
 SEARCH_PROVIDER_IDS = tuple(spec.provider for spec in _PROVIDER_SPECS if spec.supports_search)
-EXTRACT_PROVIDER_IDS = ("tavily", "exa", "linkup", "parallel", "firecrawl", "you")
+EXTRACT_PROVIDER_IDS = ("tavily", "exa", "linkup", "parallel", "firecrawl", "you", "anysearch")
 DEFAULT_PROVIDER_PRIORITY = (
     "you",
     "serper",
     "exa",
     "firecrawl",
     "tavily",
+    "anysearch",
     "linkup",
     "parallel",
     "brave",

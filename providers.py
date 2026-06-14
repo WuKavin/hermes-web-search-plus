@@ -1510,3 +1510,149 @@ def search_searxng(
             "instance_url": instance_url,
         }
     }
+
+
+def search_anysearch(
+    query: str,
+    api_key: str = "",
+    max_results: int = 5,
+    zone: str = "intl",
+    language: str = "en",
+    time_range: Optional[str] = None,
+) -> dict:
+    """Search using AnySearch AI-native search API.
+
+    AnySearch is an AI-native search infrastructure with 22 vertical domains
+    and 1,000 free anonymous searches/day.
+    """
+    endpoint = "https://api.anysearch.com/v1/search"
+
+    body: Dict[str, Any] = {
+        "query": query,
+        "max_results": max_results,
+    }
+
+    if zone:
+        body["zone"] = zone
+    if language:
+        body["language"] = language
+    if time_range and time_range != "none":
+        body["constraint"] = {"freshness": time_range}
+
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": DEFAULT_USER_AGENT,
+    }
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    data = make_request(endpoint, headers, body)
+
+    raw_results = data.get("results", [])
+    results = []
+    for i, item in enumerate(raw_results[:max_results]):
+        results.append({
+            "title": item.get("title", ""),
+            "url": item.get("url", ""),
+            "snippet": item.get("description") or item.get("content", ""),
+            "content": item.get("content", ""),
+            "score": round(item.get("score") or item.get("quality_score") or (1.0 - i * 0.1), 2),
+            "date": item.get("published_at"),
+            "source": item.get("source", "web"),
+        })
+
+    answer = ""
+    if results:
+        best = raw_results[0]
+        answer = best.get("content") or best.get("description", "")
+        if not answer:
+            answer = results[0]["snippet"]
+
+    metadata = data.get("metadata", {})
+    return {
+        "provider": "anysearch",
+        "query": query,
+        "results": results,
+        "images": [],
+        "answer": answer,
+        "metadata": {
+            "total_results": metadata.get("total_results"),
+            "search_time_ms": metadata.get("search_time_ms"),
+            "routes_queried": metadata.get("routes_queried"),
+            "request_id": metadata.get("request_id"),
+        },
+    }
+
+
+def extract_anysearch(
+    urls: List[str],
+    api_key: str = "",
+    output_format: str = "markdown",
+    include_images: bool = False,
+    include_raw_html: bool = False,
+    render_js: bool = False,
+    api_url: str = "https://api.anysearch.com/mcp",
+    timeout: int = 60,
+) -> dict:
+    """Extract URL content via AnySearch MCP extract tool.
+
+    AnySearch extract uses the MCP JSON-RPC endpoint since there is no
+    dedicated REST extract endpoint.
+    """
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": DEFAULT_USER_AGENT,
+    }
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    results: List[Dict[str, Any]] = []
+    for url in urls:
+        try:
+            rpc_body = {
+                "jsonrpc": "2.0",
+                "method": "tools/call",
+                "params": {
+                    "name": "extract",
+                    "arguments": {"url": url},
+                },
+                "id": 1,
+            }
+            data = make_request(api_url, headers, rpc_body, timeout=timeout)
+
+            # Unwrap JSON-RPC response
+            rpc_result = data
+            if "result" in data:
+                rpc_result = data["result"]
+            if isinstance(rpc_result, dict) and "content" in rpc_result:
+                # MCP tool result: content is an array of content blocks
+                content_blocks = rpc_result.get("content", [])
+                text_parts = []
+                for block in content_blocks:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        text_parts.append(block.get("text", ""))
+                markdown = "\n".join(text_parts)
+                title = ""
+                results.append(_normalize_extract_result(
+                    "anysearch", url,
+                    title=title,
+                    content=markdown,
+                    raw_content=markdown,
+                ))
+            elif isinstance(rpc_result, dict) and rpc_result.get("error"):
+                results.append(_normalize_extract_result(
+                    "anysearch", url,
+                    error=str(rpc_result["error"]),
+                ))
+            else:
+                results.append(_normalize_extract_result(
+                    "anysearch", url,
+                    content=str(rpc_result),
+                ))
+        except Exception as exc:
+            results.append(_normalize_extract_result(
+                "anysearch", url,
+                error=str(exc),
+            ))
+
+    return {"provider": "anysearch", "results": results}

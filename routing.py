@@ -714,7 +714,7 @@ class QueryAnalyzer:
         # with Exa/Firecrawl/Linkup useful by script. Keep this modest so strong class rules win.
         if language_hint not in {"en", "de"}:
             if language_hint == "zh":
-                boost_many([("exa", 7.0), ("you", 6.0), ("firecrawl", 4.0), ("linkup", 3.0), ("serper", 2.5)])
+                boost_many([("exa", 7.0), ("you", 6.0), ("firecrawl", 4.0), ("linkup", 3.0), ("serper", 2.5), ("anysearch", 8.0)])
             elif language_hint == "ar":
                 boost_many([("you", 8.0), ("linkup", 5.0), ("serper", 4.0), ("firecrawl", 2.0)])
             else:
@@ -732,7 +732,7 @@ class QueryAnalyzer:
         elif routing_class == "policy_pdf":
             boost_many([("linkup", 10.0), ("exa", 8.0), ("serper", 7.0), ("firecrawl", 6.0), ("you", 4.0)])
         elif routing_class == "official_regulatory":
-            boost_many([("exa", 8.0), ("firecrawl", 6.0), ("serper", 5.0), ("you", 3.0)])
+            boost_many([("exa", 8.0), ("anysearch", 7.0), ("firecrawl", 6.0), ("serper", 5.0), ("you", 3.0)])
         elif routing_class == "sports_current":
             boost_many([("you", 8.0), ("serper", 6.0), ("linkup", 5.0), ("tavily", 2.0)])
         elif routing_class == "github_docs":
@@ -740,7 +740,7 @@ class QueryAnalyzer:
         elif routing_class == "docs_api":
             boost_many([("serper", 6.0), ("exa", 5.0), ("you", 4.0), ("firecrawl", 3.0), ("tavily", 3.0)])
         elif routing_class == "academic_arxiv":
-            boost_many([("exa", 12.0), ("serper", 3.0), ("linkup", 2.0), ("you", 1.5)])
+            boost_many([("exa", 12.0), ("anysearch", 6.0), ("serper", 3.0), ("linkup", 2.0), ("you", 1.5)])
         elif routing_class == "oss_discovery":
             boost_many([("exa", 8.0), ("firecrawl", 5.0), ("tavily", 4.0), ("you", 3.0)])
         elif routing_class == "reddit_community":

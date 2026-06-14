@@ -388,6 +388,16 @@ def search_searxng(*args, **kwargs):
     return _providers.search_searxng(*args, **kwargs)
 
 
+def search_anysearch(*args, **kwargs):
+    _sync_provider_dependencies()
+    return _providers.search_anysearch(*args, **kwargs)
+
+
+def extract_anysearch(*args, **kwargs):
+    _sync_provider_dependencies()
+    return _providers.extract_anysearch(*args, **kwargs)
+
+
 
 # =============================================================================
 # Exa (Neural/Semantic/Deep Search)
@@ -1183,6 +1193,16 @@ def execute_search_request(args, config: Dict[str, Any]) -> Tuple[Dict[str, Any]
                 language=args.language,
                 time_range=args.time_range,
                 safesearch=args.searxng_safesearch,
+            )
+        elif prov == "anysearch":
+            anysearch_config = config.get("anysearch", {})
+            return search_anysearch(
+                query=args.query,
+                api_key=key,
+                max_results=args.max_results,
+                zone=anysearch_config.get("zone", "intl"),
+                language=anysearch_config.get("language", args.language),
+                time_range=args.time_range or args.freshness,
             )
         else:
             raise ValueError(f"Unknown provider: {prov}")
