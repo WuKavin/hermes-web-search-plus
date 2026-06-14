@@ -1548,13 +1548,16 @@ def search_anysearch(
 
     data = make_request(endpoint, headers, body)
 
-    raw_results = data.get("results", [])
+    # Unwrap AnySearch response envelope: {"code":0, "data":{"results":[...]}}
+    payload = data.get("data", data)
+    raw_results = payload.get("results", [])
     results = []
     for i, item in enumerate(raw_results[:max_results]):
+        snippet = item.get("snippet") or item.get("description") or item.get("content", "")
         results.append({
             "title": item.get("title", ""),
             "url": item.get("url", ""),
-            "snippet": item.get("description") or item.get("content", ""),
+            "snippet": snippet,
             "content": item.get("content", ""),
             "score": round(item.get("score") or item.get("quality_score") or (1.0 - i * 0.1), 2),
             "date": item.get("published_at"),
@@ -1562,13 +1565,12 @@ def search_anysearch(
         })
 
     answer = ""
-    if results:
+    if raw_results:
         best = raw_results[0]
-        answer = best.get("content") or best.get("description", "")
+        answer = best.get("content") or best.get("snippet") or best.get("description", "")
         if not answer:
             answer = results[0]["snippet"]
 
-    metadata = data.get("metadata", {})
     return {
         "provider": "anysearch",
         "query": query,
@@ -1576,10 +1578,8 @@ def search_anysearch(
         "images": [],
         "answer": answer,
         "metadata": {
-            "total_results": metadata.get("total_results"),
-            "search_time_ms": metadata.get("search_time_ms"),
-            "routes_queried": metadata.get("routes_queried"),
-            "request_id": metadata.get("request_id"),
+            "code": data.get("code"),
+            "message": data.get("message"),
         },
     }
 
