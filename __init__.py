@@ -1189,7 +1189,7 @@ def register(ctx: Any) -> None:
                 },
                 "provider": {
                     "type": "string",
-                    "enum": ["auto", "serper", "serpbase", "brave", "tavily", "exa", "querit", "linkup", "firecrawl", "parallel", "perplexity", "kilo-perplexity", "you", "searxng"],
+                    "enum": ["auto", "serper", "serpbase", "anysearch", "brave", "tavily", "exa", "querit", "linkup", "firecrawl", "parallel", "perplexity", "kilo-perplexity", "you", "searxng"],
                     "description": "Search provider. Use 'auto' for intelligent routing (default). Brave and Serper share generic web-search intents and ties are distributed deterministically per query.",
                     "default": "auto",
                 },
@@ -1305,7 +1305,7 @@ def register(ctx: Any) -> None:
             "type": "object",
             "properties": {
                 "urls": {"type": "array", "items": {"type": "string"}, "description": "URLs to extract"},
-                "provider": {"type": "string", "enum": ["auto", "firecrawl", "linkup", "parallel", "tavily", "exa", "you"], "default": "auto"},
+                "provider": {"type": "string", "enum": ["auto", "firecrawl", "linkup", "parallel", "tavily", "exa", "you", "anysearch"], "default": "auto"},
                 "format": {"type": "string", "enum": ["markdown", "html"], "default": "markdown"},
                 "include_images": {"type": "boolean", "default": False},
                 "include_raw_html": {"type": "boolean", "default": False},
