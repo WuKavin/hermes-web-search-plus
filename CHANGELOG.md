@@ -1,5 +1,27 @@
 # Changelog
 
+## [v2.5.0] — 2026-06-16
+
+### Credits
+- #51 by @robbyczgw-cla — research/extraction budget enforcement, bounded daemonized provider work, 429 handling, and cooldown decay.
+- #53 by @robbyczgw-cla — adaptive routing performance memory plus spam/mirror result filtering; rebased continuation of #52 after the stacked base landed.
+
+### ✨ Added
+- Added provider performance memory so auto-routing can learn from recent provider latency/success behavior without polluting live operator state during tests. (#53)
+- Added spam/mirror result filtering and domain diversity safeguards for cleaner search results. (#53)
+
+### 🐛 Fixed
+- Research mode and concurrent extraction now enforce remaining time budgets around submitted futures, preserving partial completed results instead of waiting behind slow providers. (#51)
+- Provider HTTP handling now treats `429 Retry-After` separately from generic transient failures and caps inline waiting so rate limits become cooldown metadata rather than user-visible hangs. (#51)
+- Provider cooldown escalation now decays stale failure history instead of punishing isolated old failures forever. (#51)
+
+### 🔧 Improved
+- Result filtering now matches blocked domains only by exact domain or true subdomain, avoiding lookalike false positives such as `blocked.example.evil.test`. (#53)
+- Explicit domain intent (`site:` queries and `include_domains`) now bypasses default diversity/spam reranking so user constraints win. (#53)
+
+### 🧪 Tests
+- Added process-exit, daemon task, budget timeout, rate-limit, provider health decay, provider stats, and result-quality filter regression coverage. (#51, #53)
+
 ## [v2.4.0] — 2026-06-08
 
 ### Credits
