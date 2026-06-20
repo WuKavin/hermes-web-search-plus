@@ -247,7 +247,7 @@ def test_setup_dry_run_uses_target_env_path_for_dashboard(tmp_path, monkeypatch,
     args.func(args)
 
     out = capsys.readouterr().out
-    assert "Providers: 1/13 configured" in out
+    assert "Providers: 1/14 configured" in out
     assert "Active: You.com" in out
     assert "Brave Search" not in out.split("Setup plan:", 1)[0]
 
@@ -263,7 +263,7 @@ def test_status_uses_target_env_path_for_dashboard(tmp_path, monkeypatch, capsys
     args.func(args)
 
     out = capsys.readouterr().out
-    assert "Providers: 1/13 configured" in out
+    assert "Providers: 1/14 configured" in out
     assert "Active: Linkup" in out
     assert "Brave Search" not in out
 
@@ -384,7 +384,7 @@ def test_config_set_auto_allow_updates_provider_gate(tmp_path):
 def test_default_behavior_config_blocks_low_trust_auto_providers():
     config = wsp._default_behavior_config()
 
-    assert config["auto_routing"]["provider_priority"][:6] == ["you", "serper", "exa", "firecrawl", "tavily", "linkup"]
+    assert config["auto_routing"]["provider_priority"][:6] == ["you", "serper", "exa", "firecrawl", "tavily", "anysearch"]
     assert config["auto_routing"]["auto_allow"]["serpbase"] is False
     assert config["auto_routing"]["auto_allow"]["querit"] is False
     assert config["auto_routing"]["auto_allow"]["brave"] is False

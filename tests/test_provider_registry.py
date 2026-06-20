@@ -9,6 +9,7 @@ def test_provider_registry_is_the_complete_capability_source():
     assert registry.SEARCH_PROVIDER_IDS == (
         "serper",
         "serpbase",
+        "anysearch",
         "brave",
         "tavily",
         "querit",
@@ -21,7 +22,7 @@ def test_provider_registry_is_the_complete_capability_source():
         "you",
         "searxng",
     )
-    assert registry.EXTRACT_PROVIDER_IDS == ("tavily", "exa", "linkup", "parallel", "firecrawl", "you")
+    assert registry.EXTRACT_PROVIDER_IDS == ("tavily", "exa", "linkup", "parallel", "firecrawl", "you", "anysearch")
     assert registry.PROVIDER_SPECS["serper"].env_var == "SERPER_API_KEY"
     assert registry.PROVIDER_SPECS["tavily"].supports_extract is True
     assert registry.PROVIDER_SPECS["brave"].auto_allowed_by_default is False
