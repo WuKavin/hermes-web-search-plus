@@ -31,11 +31,13 @@ jobs:
           python -m py_compile
           search.py
           __init__.py
+          daemon_tasks.py
           http_client.py
           cache.py
           config.py
           env_loader.py
           provider_health.py
+          provider_stats.py
           quality.py
           research.py
           routing.py
