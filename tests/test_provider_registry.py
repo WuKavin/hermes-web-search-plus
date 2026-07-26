@@ -6,10 +6,9 @@ import __init__ as plugin
 
 
 def test_provider_registry_is_the_complete_capability_source():
-    assert registry.SEARCH_PROVIDER_IDS == (
+    assert registry.SEARCH_PROVIDER_IDS[:12] == (
         "serper",
         "serpbase",
-        "anysearch",
         "brave",
         "tavily",
         "querit",
@@ -17,15 +16,32 @@ def test_provider_registry_is_the_complete_capability_source():
         "exa",
         "firecrawl",
         "parallel",
-        "perplexity",
-        "kilo-perplexity",
+
         "you",
         "searxng",
+        "keenable",
     )
-    assert registry.EXTRACT_PROVIDER_IDS == ("tavily", "exa", "linkup", "parallel", "firecrawl", "you", "anysearch")
+    assert registry.SEARCH_PROVIDER_IDS[-1] == "hound"
+    assert registry.EXTRACT_PROVIDER_IDS == (
+        "tavily", "exa", "linkup", "parallel", "firecrawl", "you", "keenable", "serper", "anysearch", "hound"
+    )
+    assert registry.PROVIDER_SPECS["hound"].auto_allowed_by_default is False
+    assert registry.PROVIDER_SPECS["serper"].supports_extract is True
+    assert registry.PROVIDER_SPECS["keenable"].supports_extract is True
+    assert registry.PROVIDER_SPECS["keenable"].supports_search is True
+    assert registry.PROVIDER_SPECS["keenable"].keyless is True
+    assert registry.KEYLESS_EXTRACT_PROVIDER_IDS == ("keenable",)
+    assert registry.KEYLESS_PROVIDER_IDS == ("keenable",)
     assert registry.PROVIDER_SPECS["serper"].env_var == "SERPER_API_KEY"
     assert registry.PROVIDER_SPECS["tavily"].supports_extract is True
-    assert registry.PROVIDER_SPECS["brave"].auto_allowed_by_default is False
+    assert registry.PROVIDER_SPECS["brave"].auto_allowed_by_default is True
+    assert registry.DEFAULT_PROVIDER_PRIORITY[6] == "brave"
+    assert registry.DEFAULT_AUTO_ALLOW == {
+        "serpbase": False,
+        "querit": False,
+        "parallel": False,
+        "hound": False,
+    }
     assert "research" in registry.PROVIDER_SPECS["tavily"].capability_labels
 
 

@@ -21,8 +21,14 @@ The plugin does not run a separate hosted backend. It does not add an analytics 
 - `plugin.yaml`: plugin manifest, optional environment variables, onboarding commands, and tool declarations.
 - `__init__.py`: Hermes plugin entrypoint, tool schemas, setup/onboarding helpers, and wrapper functions exposed to Hermes.
 - `search.py`: provider adapters, routing, caching, cooldowns, extraction, and CLI.
+- `provider_registry.py`: data-only provider metadata registry (single source of truth).
+- `provider_dispatch.py`: registry-driven `SEARCH_DISPATCH`/`EXTRACT_DISPATCH` adapter tables used by `search.py` and `extract.py`.
 - `setup.py`: thin standalone CLI entrypoint that loads setup helpers from `__init__.py`.
 - `tests/`: unit and regression coverage for providers, onboarding, routing, extraction, and docs-sensitive configuration.
+
+## Compatibility shims
+
+Compatibility shims in `search.py` intentionally preserve legacy imports and monkeypatch seams while the modular split settles. The public shim policy is available via `get_compatibility_shim_policy()` and must keep wrappers in place until the ProviderSpec registry has stabilized for a documented minor release window.
 
 ## Tool surface
 
@@ -37,9 +43,9 @@ Each provider adapter normalizes provider-specific request and response details 
 
 Provider capability classes:
 
-- Search-only: Brave, Serper, Perplexity, Kilo Perplexity, SearXNG, SerpBase, Querit. Brave, Perplexity/Kilo Perplexity, SerpBase, and Querit default to `auto_allow=false` and are explicit/guarded unless users opt in.
-- Search and extraction: You.com, Firecrawl, Tavily, Exa, Linkup.
-- Answer-style search: Perplexity and Kilo Perplexity return direct-answer style search results, but default auto-routing treats them as guarded providers rather than fast search providers.
+- Search-only: Brave, SearXNG, SerpBase, and Querit. Brave participates in the default auto-pool at priority 7; Parallel, SerpBase, and Querit default to `auto_allow=false` and are explicit/guarded unless users opt in.
+- Search and extraction: You.com, Serper, Firecrawl, Tavily, Exa, Linkup, Parallel, Keenable, and the optional local Hound MCP sidecar. Serper extraction uses its webpage scraper (`scrape.serper.dev`) and sits last in the default auto-extraction fallback chain. Hound defaults to `auto_allow=false` for both capabilities and is explicit-only unless deliberately enabled.
+- Rejected legacy endpoints: native Perplexity and Kilo Perplexity remain metadata-only rejection records because no verified source-only endpoint is registered.
 
 Provider pricing, freshness, ranking, localization, and vertical support are controlled by the providers. The plugin normalizes responses; it does not make providers equivalent.
 
@@ -57,22 +63,21 @@ Default routing config includes:
   "auto_routing": {
     "enabled": true,
     "fallback_provider": "serper",
-    "provider_priority": ["you", "serper", "exa", "firecrawl", "tavily", "linkup", "parallel", "brave", "serpbase", "querit", "kilo-perplexity", "perplexity", "searxng"],
+    "provider_priority": ["you", "serper", "exa", "firecrawl", "tavily", "linkup", "parallel", "brave", "serpbase", "querit", "searxng", "keenable"],
+    "extract_provider_priority": ["tavily", "exa", "linkup", "parallel", "firecrawl", "you", "keenable", "serper"],
     "disabled_providers": [],
     "auto_allow": {
       "serpbase": false,
       "querit": false,
       "brave": false,
-      "parallel": false,
-      "kilo-perplexity": false,
-      "perplexity": false
+      "parallel": false
     },
     "confidence_threshold": 0.3
   }
 }
 ```
 
-Secrets and routing are separate so users can configure a provider key without automatically letting that provider receive automatic traffic.
+Secrets and routing are separate so users can configure a provider key without automatically letting that provider receive automatic traffic. Search `provider_priority` and `extract_provider_priority` are independent: search ranking does not silently reorder URL extraction. A partial extraction list is normalized and completed with missing extract-capable providers in registry order.
 
 ## Routing engine
 
@@ -104,9 +109,7 @@ Example:
   "serpbase": false,
   "parallel": false,
   "querit": false,
-  "brave": false,
-  "kilo-perplexity": false,
-  "perplexity": false
+  "brave": false
 }
 ```
 
@@ -215,15 +218,24 @@ The plugin does not promise “no data leaves your machine.” A more accurate s
 
 ## Extending with a new provider
 
+Provider wiring is registry-driven. `provider_registry.py` is the data-only
+single source of truth (id, env var, capabilities, onboarding metadata,
+`auto_allow` default), and `provider_dispatch.py` maps each provider id to a
+search/extract adapter in `SEARCH_DISPATCH` / `EXTRACT_DISPATCH`. CLI choices,
+tool-schema enums, doctor output, onboarding, and extraction priority all
+derive from the registry, and completeness tests
+(`tests/test_provider_dispatch.py`) fail if a registry entry has no dispatch
+adapter or vice versa — a new provider can no longer be silently forgotten on
+one surface.
+
 A provider addition should include:
 
-- provider adapter function in `search.py`
-- API key mapping in runtime and onboarding code
-- provider metadata in setup/list/status output
-- routing score/match behavior if it participates in auto-routing
-- explicit default `auto_allow` decision
-- docs in README, User Guide, FAQ, and Architecture when behavior is user-visible
-- tests for response normalization, missing-key behavior, routing eligibility, onboarding metadata, and CLI/provider choices
+- a `ProviderSpec` entry in `provider_registry.py` (id, env var, capabilities, `auto_allow` default)
+- provider function(s) in `providers.py` (`search_<provider>`, optionally `extract_<provider>`) plus the `search.py` seam wrapper
+- a dispatch adapter per capability in `provider_dispatch.py`, registered in `SEARCH_DISPATCH`/`EXTRACT_DISPATCH`
+- routing score/match behavior in `routing.py` if it participates in auto-routing
+- docs in README, User Guide, FAQ, and Architecture when behavior is user-visible (`docs/PROVIDERS.md` regenerates from the registry)
+- tests for response normalization and missing-key behavior (dispatch/enum/onboarding completeness is enforced by existing registry-driven tests)
 
 Default stance: new or surprising providers should start explicit-only until their cost and quality characteristics are boring enough for automatic fallback.
 

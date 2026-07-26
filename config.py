@@ -9,13 +9,28 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from env_loader import clean_env_value as _shared_clean_env_value, load_env_files
-from provider_registry import DEFAULT_AUTO_ALLOW, DEFAULT_PROVIDER_PRIORITY, PROVIDER_SPECS
+from env_loader import clean_env_value as _shared_clean_env_value, is_truthy, load_env_files
+from errors_v3 import ProviderConfigError
+from provider_registry import (
+    DEFAULT_AUTO_ALLOW,
+    DEFAULT_PROVIDER_PRIORITY,
+    EXTRACT_PROVIDER_IDS,
+    KEYLESS_EXTRACT_PROVIDER_IDS,
+    KEYLESS_PROVIDER_IDS,
+    PROVIDER_SPECS,
+    keyless_public_env_var,
+)
 
 
-class ProviderConfigError(Exception):
-    """Raised when a provider is missing or has an invalid API key/config."""
-    pass
+class SelfHostedProfileError(ProviderConfigError):
+    """Raised when the self-hosted profile has no usable automatic provider."""
+
+    error_type = "self_hosted_profile_unavailable"
+
+
+SUPPORTED_PROFILES = frozenset({"standard", "self_hosted"})
+SELF_HOSTED_SEARCH_PROVIDER_IDS = ("searxng", *KEYLESS_PROVIDER_IDS)
+SELF_HOSTED_EXTRACT_PROVIDER_IDS = tuple(KEYLESS_EXTRACT_PROVIDER_IDS)
 
 
 def _is_placeholder_env_value(value: str) -> bool:
@@ -33,29 +48,95 @@ def _load_env_file():
 
 DEFAULT_CONFIG = {
     "version": 1,
+    "profile": "standard",
     "default_provider": None,
     "defaults": {
         "provider": "serper",
-        "max_results": 5
+        "max_results": 5,
+        # Global locale defaults for providers with country/language request
+        # parameters (serper, brave, you, serpbase, querit, firecrawl,
+        # searxng). country: ISO 3166-1 alpha-2 (e.g. "at"); language:
+        # ISO 639-1 code, or "auto" for conservative query language
+        # inference. Unset values fall back to us/en. Explicit provider
+        # sections in config.json (e.g. serper.country) still win — see
+        # search_locale.resolve_locale for the full precedence.
+        "locale": {
+            "country": None,
+            "language": None,
+        },
     },
     "auto_routing": {
         "enabled": True,
-        "fallback_provider": "serper",
+        "fallback_provider": "anysearch",
         # Low-trust / experimental providers can stay configured for explicit use
         # without being selected automatically.
         "provider_priority": list(DEFAULT_PROVIDER_PRIORITY),
+        "extract_provider_priority": list(EXTRACT_PROVIDER_IDS),
         "disabled_providers": [],
         "auto_allow": dict(DEFAULT_AUTO_ALLOW),
         "confidence_threshold": 0.3,  # Below this, note low confidence
     },
+    "routing": {
+        # Fail-closed operator policy boundary. Shadow intent is accepted only
+        # when this ceiling is explicitly changed to "shadow".
+        "policy_mode": "classic",
+    },
+    "budget_preflight": {
+        # Disabled and unbounded by default: existing requests keep their
+        # exact routing and execution behaviour until an operator opts in.
+        "enabled": False,
+        "max_provider_calls_per_request": None,
+        "max_daily_provider_calls": None,
+        "max_timeout_seconds": None,
+        "max_context_chars": None,
+        "on_exceed": "degrade",
+    },
+    "quality": {
+        # Diversity diagnostics are always safe to calculate.  Reordering
+        # research results is separately opt-in so the default remains an
+        # exact behavioural match for existing result ordering.
+        "diversity": {
+            "rerank": False,
+            "near_duplicate_threshold": 0.6,
+        },
+        # Return from Research fan-out only after independently contributing
+        # providers have filled a small, diverse result head. The target is
+        # capped so large result requests do not become latency deadlines.
+        "research_quorum": {
+            "enabled": True,
+            "min_contributing_providers": 2,
+            "result_target_cap": 5,
+            "min_unique_domains": 3,
+        },
+    },
+    "web": {
+        # Maximum cleaned characters returned inline per extracted result before
+        # truncate-and-store keeps the full text on disk for page-on-demand.
+        "extract_char_limit": 15000,
+    },
+    "extract": {
+        # Target URLs supplied to extract_plus are blocked when they resolve to
+        # private/internal networks. Operators can opt in for trusted intranet use.
+        "allow_private_urls": False,
+    },
+    "bounded_context": {
+        # Operator ceiling; callers may request less but never more.
+        "max_urls": 10,
+        # Native-v3 per-call default remains 60k codepoints; hard max is 200k.
+        "max_context_chars": 60000,
+        "full_text_ttl_seconds": 604800,
+        "full_text_max_bytes": 268435456,
+    },
+    # Note: provider country/language keys are intentionally absent from the
+    # built-in defaults so search_locale.resolve_locale can treat a present
+    # key as an explicit user override from config.json.
     "serper": {
-        "country": "us",
-        "language": "en",
-        "type": "search"
+        "type": "search",
+        # Webpage scraper endpoint; operator-overridable for compatible
+        # self-hosted/proxy services (firecrawl scrape_url pattern).
+        "scrape_url": "https://scrape.serper.dev"
     },
     "brave": {
-        "country": "US",
-        "search_lang": "en",
         "safesearch": "moderate",
     },
     "tavily": {
@@ -88,8 +169,8 @@ DEFAULT_CONFIG = {
         "timeout": 45,
         "extract_timeout": 60,
         "client_model": None,
-        "max_chars_total": 12000,
-        "max_chars_per_result": 6000
+        "max_chars_total": 120000,
+        "max_chars_per_result": 60000
     },
     "kilo-perplexity": {
         "api_url": "https://api.kilo.ai/api/gateway/chat/completions",
@@ -97,27 +178,39 @@ DEFAULT_CONFIG = {
     },
     "firecrawl": {
         "api_url": "https://api.firecrawl.dev/v2/search",
-        "country": "US",
         "timeout": 30000,
         "sources": ["web"],
         "ignore_invalid_urls": False
     },
     "you": {
-        "country": "us",
         "safesearch": "moderate"
     },
     "serpbase": {
         "api_url": "https://api.serpbase.dev/google/search",
-        "country": "us",
-        "language": "en",
         "page": 1,
         "timeout": 30,
     },
     "searxng": {
+        # ``base_url`` is the canonical v3.1 name. ``instance_url`` remains
+        # supported for existing configs and environments.
+        "base_url": None,
         "instance_url": None,  # Required - user must set their own instance
         "safesearch": 0,  # 0=off, 1=moderate, 2=strict
         "engines": None,  # Optional list of engines to use
-        "language": "en"
+    },
+    "keenable": {
+        "search_url": "https://api.keenable.ai/v1/search",
+        "fetch_url": "https://api.keenable.ai/v1/fetch",
+        "timeout": 30,
+        "allow_public": False
+    },
+    "anysearch": {
+        "search_url": "https://api.anysearch.com/v1/search",
+        "extract_url": "https://api.anysearch.com/mcp",
+        "zone": "intl",
+        "language": "en",
+        "timeout": 30,
+        "extract_timeout": 60
     }
 }
 
@@ -177,6 +270,95 @@ def _append_missing_default_providers(providers: List[str]) -> List[str]:
     return merged
 
 
+def _normalize_extract_provider_list_config(value: Any) -> List[str]:
+    if isinstance(value, str):
+        raw_values = [item.strip() for item in value.split(",")]
+    elif isinstance(value, list):
+        raw_values = [str(item).strip() for item in value]
+    else:
+        raise ValueError("extract provider list must be a string or list")
+    providers = []
+    seen = set()
+    extract_providers = set(EXTRACT_PROVIDER_IDS)
+    for raw in raw_values:
+        if not raw:
+            continue
+        provider = _normalize_routing_provider_config(raw)
+        if provider not in extract_providers:
+            raise ValueError(f"provider does not support extraction: {provider}")
+        if provider in seen:
+            continue
+        seen.add(provider)
+        providers.append(provider)
+    if not providers:
+        raise ValueError("extract provider list cannot be empty")
+    return providers
+
+
+def _append_missing_extract_providers(providers: List[str]) -> List[str]:
+    seen = set(providers)
+    return list(providers) + [provider for provider in EXTRACT_PROVIDER_IDS if provider not in seen]
+
+
+def is_self_hosted_profile(config: Dict[str, Any]) -> bool:
+    """Return whether a runtime config selects the no-paid-key profile."""
+    return config.get("profile", "standard") == "self_hosted"
+
+
+def apply_profile_effects(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Derive profile-owned routing settings without persisting duplicate config.
+
+    The selected profile is the only durable setting.  Its effective automatic
+    routing policy is reconstructed whenever the config is loaded so later
+    default-priority changes do not leave stale copied profile settings behind.
+    Explicit provider calls do not use this automatic-routing gate.
+    """
+    profile = config.get("profile", "standard")
+    if profile not in SUPPORTED_PROFILES:
+        raise ValueError("profile must be standard or self_hosted")
+    config["profile"] = profile
+    if profile != "self_hosted":
+        return config
+
+    auto = config.get("auto_routing")
+    if auto is None:
+        # Direct in-process callers may supply only ``profile``. Persisted
+        # configs are merged with defaults before this point, but this keeps
+        # the one-switch profile usable on the public helper surface too.
+        auto = json.loads(json.dumps(DEFAULT_CONFIG["auto_routing"]))
+        config["auto_routing"] = auto
+    if not isinstance(auto, dict):
+        raise ValueError("auto_routing must be an object")
+    auto["provider_priority"] = list(SELF_HOSTED_SEARCH_PROVIDER_IDS)
+    auto["fallback_provider"] = "keenable"
+    auto["extract_provider_priority"] = list(SELF_HOSTED_EXTRACT_PROVIDER_IDS)
+    auto["auto_allow"] = {
+        provider: provider in SELF_HOSTED_SEARCH_PROVIDER_IDS
+        for provider, spec in PROVIDER_SPECS.items()
+        if spec.supports_search
+    }
+    return config
+
+
+def self_hosted_profile_error(config: Dict[str, Any]) -> Optional[SelfHostedProfileError]:
+    """Return a typed readiness error when self-hosted AUTO has no provider.
+
+    This deliberately checks only local configuration state. URL reachability
+    belongs to request execution; status/doctor must never make a provider call.
+    """
+    if not is_self_hosted_profile(config):
+        return None
+    searxng = config.get("searxng", {})
+    has_searxng_url = isinstance(searxng, dict) and bool(
+        searxng.get("base_url") or searxng.get("instance_url")
+    )
+    if has_searxng_url or provider_configured("keenable", config):
+        return None
+    return SelfHostedProfileError(
+        "self_hosted profile requires searxng.base_url or an enabled Keenable keyless/public endpoint"
+    )
+
+
 def _validate_runtime_config(config: Dict[str, Any]) -> Dict[str, Any]:
     auto = config.get("auto_routing", {})
     if not isinstance(auto, dict):
@@ -188,6 +370,11 @@ def _validate_runtime_config(config: Dict[str, Any]) -> Dict[str, Any]:
     if auto.get("provider_priority"):
         priority = _normalize_routing_provider_list_config(auto["provider_priority"])
         auto["provider_priority"] = _append_missing_default_providers(priority) if auto.get("enabled", True) is not False else priority
+    if auto.get("extract_provider_priority"):
+        extract_priority = _normalize_extract_provider_list_config(auto["extract_provider_priority"])
+        auto["extract_provider_priority"] = _append_missing_extract_providers(extract_priority)
+    else:
+        auto["extract_provider_priority"] = list(EXTRACT_PROVIDER_IDS)
     if "disabled_providers" in auto:
         disabled = auto.get("disabled_providers") or []
         if disabled:
@@ -212,8 +399,112 @@ def _validate_runtime_config(config: Dict[str, Any]) -> Dict[str, Any]:
         auto["confidence_threshold"] = threshold
     if config.get("default_provider") and config["default_provider"] in set(auto.get("disabled_providers", [])):
         raise ValueError("default_provider cannot be disabled")
+    routing = config.get("routing", dict(DEFAULT_CONFIG["routing"]))
+    if not isinstance(routing, dict):
+        raise ValueError("routing must be an object")
+    policy_mode = routing.get("policy_mode", "classic")
+    if policy_mode not in {"classic", "shadow"}:
+        raise ValueError("routing.policy_mode must be classic or shadow")
+    routing["policy_mode"] = policy_mode
+    budget_preflight = config.get(
+        "budget_preflight", dict(DEFAULT_CONFIG["budget_preflight"])
+    )
+    if not isinstance(budget_preflight, dict):
+        raise ValueError("budget_preflight must be an object")
+    if not isinstance(budget_preflight.get("enabled"), bool):
+        raise ValueError("budget_preflight.enabled must be a boolean")
+    for name in (
+        "max_provider_calls_per_request",
+        "max_daily_provider_calls",
+        "max_timeout_seconds",
+        "max_context_chars",
+    ):
+        value = budget_preflight.get(name)
+        if value is not None and (
+            isinstance(value, bool) or not isinstance(value, int) or value < 1
+        ):
+            raise ValueError(
+                f"budget_preflight.{name} must be a positive integer or null"
+            )
+    if budget_preflight.get("max_context_chars") not in (None,) and (
+        budget_preflight["max_context_chars"] < 1000
+        or budget_preflight["max_context_chars"] > 200000
+    ):
+        raise ValueError(
+            "budget_preflight.max_context_chars must be between 1000 and 200000"
+        )
+    if budget_preflight.get("on_exceed") not in {"degrade", "abort"}:
+        raise ValueError("budget_preflight.on_exceed must be degrade or abort")
+    quality = config.get("quality", dict(DEFAULT_CONFIG["quality"]))
+    if not isinstance(quality, dict):
+        raise ValueError("quality must be an object")
+    diversity = quality.get("diversity", {})
+    if not isinstance(diversity, dict):
+        raise ValueError("quality.diversity must be an object")
+    default_diversity = DEFAULT_CONFIG["quality"]["diversity"]
+    diversity = {**default_diversity, **diversity}
+    if not isinstance(diversity["rerank"], bool):
+        raise ValueError("quality.diversity.rerank must be a boolean")
+    threshold = diversity["near_duplicate_threshold"]
+    if isinstance(threshold, bool) or not isinstance(threshold, (int, float)):
+        raise ValueError("quality.diversity.near_duplicate_threshold must be a number")
+    threshold = float(threshold)
+    if threshold < 0.0 or threshold > 1.0:
+        raise ValueError(
+            "quality.diversity.near_duplicate_threshold must be between 0.0 and 1.0"
+        )
+    diversity["near_duplicate_threshold"] = threshold
+    quality["diversity"] = diversity
+    research_quorum = quality.get("research_quorum", {})
+    if not isinstance(research_quorum, dict):
+        raise ValueError("quality.research_quorum must be an object")
+    default_research_quorum = DEFAULT_CONFIG["quality"]["research_quorum"]
+    research_quorum = {**default_research_quorum, **research_quorum}
+    if not isinstance(research_quorum["enabled"], bool):
+        raise ValueError("quality.research_quorum.enabled must be a boolean")
+    quorum_bounds = {
+        "min_contributing_providers": (2, 50),
+        "result_target_cap": (1, 50),
+        "min_unique_domains": (1, 50),
+    }
+    for name, (minimum, maximum) in quorum_bounds.items():
+        value = research_quorum[name]
+        if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
+            raise ValueError(
+                f"quality.research_quorum.{name} must be an integer between {minimum} and {maximum}"
+            )
+    quality["research_quorum"] = research_quorum
+    bounded = config.get(
+        "bounded_context", dict(DEFAULT_CONFIG["bounded_context"])
+    )
+    if not isinstance(bounded, dict):
+        raise ValueError("bounded_context must be an object")
+    integer_bounds = {
+        "max_urls": (1, 50),
+        "max_context_chars": (1000, 200000),
+        "full_text_ttl_seconds": (0, None),
+        "full_text_max_bytes": (0, None),
+    }
+    for name, (minimum, maximum) in integer_bounds.items():
+        value = bounded.get(name)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"bounded_context.{name} must be an integer")
+        if value < minimum or (maximum is not None and value > maximum):
+            upper = f" and {maximum}" if maximum is not None else ""
+            raise ValueError(
+                f"bounded_context.{name} must be between {minimum}{upper}"
+            )
+    cache_root = bounded.get("cache_root")
+    if cache_root is not None and (
+        not isinstance(cache_root, str) or not cache_root.strip()
+    ):
+        raise ValueError("bounded_context.cache_root must be a non-empty string")
     config["auto_routing"] = auto
-    return config
+    config["routing"] = routing
+    config["budget_preflight"] = budget_preflight
+    config["quality"] = quality
+    config["bounded_context"] = bounded
+    return apply_profile_effects(config)
 
 
 def _unique_timestamped_path(path: Path, marker: str) -> Path:
@@ -248,7 +539,7 @@ def load_config() -> Dict[str, Any]:
 
     if config_path.exists():
         try:
-            with open(config_path) as f:
+            with open(config_path, encoding="utf-8") as f:
                 user_config = json.load(f)
                 for key, value in user_config.items():
                     if isinstance(value, dict) and key in config:
@@ -260,7 +551,9 @@ def load_config() -> Dict[str, Any]:
             _quarantine_runtime_config(config_path, str(e))
             config = _deepcopy_default_config()
 
-    return config
+    # Defaults need no migration, but applying this here keeps direct/default
+    # loads on the same profile-derived path as persisted configurations.
+    return apply_profile_effects(config)
 
 
 def get_api_key(provider: str, config: Dict[str, Any] = None) -> Optional[str]:
@@ -286,6 +579,32 @@ def get_api_key(provider: str, config: Dict[str, Any] = None) -> Optional[str]:
     # Then check environment
     spec = PROVIDER_SPECS.get(provider)
     return _clean_env_value(os.environ.get(spec.env_var if spec else "", ""))
+
+
+def keyless_public_allowed(provider: str, config: Dict[str, Any] = None) -> bool:
+    """Whether a keyless provider may use its unauthenticated public endpoint.
+
+    Off by default; opt in via config.json (``<provider>.allow_public``) or the
+    ``<PROVIDER>_ALLOW_PUBLIC`` env var.
+    """
+    spec = PROVIDER_SPECS.get(provider)
+    if not (spec and spec.keyless):
+        return False
+    section = (config or {}).get(spec.config_section, {})
+    if isinstance(section, dict) and is_truthy(section.get("allow_public")):
+        return True
+    return is_truthy(os.environ.get(keyless_public_env_var(provider)))
+
+
+def provider_configured(provider: str, config: Dict[str, Any] = None) -> bool:
+    """Whether a provider can run: it has a key, or its keyless public endpoint is opted in.
+
+    Distinct from ``get_api_key`` truthiness so key-status logic never treats a
+    keyless provider as keyed.
+    """
+    if get_api_key(provider, config):
+        return True
+    return keyless_public_allowed(provider, config)
 
 
 def _validate_searxng_url(url: str) -> str:
@@ -338,7 +657,8 @@ def get_searxng_instance_url(config: Dict[str, Any] = None) -> Optional[str]:
     """Get SearXNG instance URL from config or environment.
 
     SearXNG is self-hosted, so no API key needed - just the instance URL.
-    Priority: config.json > SEARXNG_INSTANCE_URL environment variable
+    Priority: config.json searxng.base_url > legacy instance_url >
+    SEARXNG_INSTANCE_URL environment variable.
 
     Security: URL is validated to prevent SSRF via scheme enforcement.
     Both config sources (config.json, env var) are operator-controlled,
@@ -348,7 +668,7 @@ def get_searxng_instance_url(config: Dict[str, Any] = None) -> Optional[str]:
     if config:
         searxng_config = config.get("searxng", {})
         if isinstance(searxng_config, dict):
-            url = searxng_config.get("instance_url")
+            url = searxng_config.get("base_url") or searxng_config.get("instance_url")
             if url:
                 return _validate_searxng_url(url)
 
@@ -365,8 +685,11 @@ def get_env_key(provider: str) -> Optional[str]:
     return get_api_key(provider)
 
 
-def validate_api_key(provider: str, config: Dict[str, Any] = None) -> str:
-    """Validate and return API key (or instance URL for SearXNG), with helpful error messages."""
+def validate_api_key(provider: str, config: Dict[str, Any] = None) -> Optional[str]:
+    """Validate and return the API key (or SearXNG instance URL), with helpful error messages.
+
+    Returns None for a keyless provider whose public endpoint is opted in.
+    """
     key = get_api_key(provider, config)
 
     # Special handling for SearXNG - it needs instance URL, not API key
@@ -394,6 +717,9 @@ def validate_api_key(provider: str, config: Dict[str, Any] = None) -> str:
             }))
 
         return key
+
+    if not key and keyless_public_allowed(provider, config):
+        return None
 
     if not key:
         spec = PROVIDER_SPECS[provider]

@@ -3,6 +3,8 @@
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 import json
 import re
+import socket
+import sys
 import threading
 import time
 from typing import Any, Dict, List, Optional
@@ -21,11 +23,138 @@ from http_client import (
     make_request,
 )
 from quality import _title_from_url
+from request_gate_v3 import validate_outbound_body, validate_provider_mode
 
 
 # Extra scheduling headroom added on top of the per-request HTTP timeout when
 # bounding a concurrent extraction batch.
 _BATCH_TIMEOUT_GRACE_SECONDS = 5
+
+
+# =============================================================================
+# Unified freshness filter
+# =============================================================================
+
+FRESHNESS_VALUES = ("day", "week", "month", "year")
+
+# Native recency formats per provider, derived from the request bodies the
+# provider functions in this module already send. Providers absent from this
+# table (tavily, exa, linkup, parallel, serpbase) have no relative-recency
+# parameter in their current API calls, so no native value is invented for them.
+PROVIDER_FRESHNESS_FORMATS: Dict[str, Dict[str, str]] = {
+    # search_serper: body["tbs"]
+    "serper": {"day": "qdr:d", "week": "qdr:w", "month": "qdr:m", "year": "qdr:y"},
+    # search_brave: params["freshness"]
+    "brave": {"day": "pd", "week": "pw", "month": "pm", "year": "py"},
+    # search_querit: filters["timeRange"]["date"]
+    "querit": {"day": "d1", "week": "w1", "month": "m1", "year": "y1"},
+    # search_firecrawl: body["tbs"]
+    "firecrawl": {"day": "qdr:d", "week": "qdr:w", "month": "qdr:m", "year": "qdr:y"},
+    # search_keenable: body["published_after"]
+    "keenable": {"day": "1d", "week": "7d", "month": "1mo", "year": "1y"},
+    # search_you: params["freshness"] (native values match the unified ones)
+    "you": {"day": "day", "week": "week", "month": "month", "year": "year"},
+    # search_perplexity: body["search_recency_filter"]
+    "perplexity": {"day": "day", "week": "week", "month": "month", "year": "year"},
+    "kilo-perplexity": {"day": "day", "week": "week", "month": "month", "year": "year"},
+    # search_searxng: params["time_range"]
+    "searxng": {"day": "day", "week": "week", "month": "month", "year": "year"},
+}
+
+
+def normalize_freshness(value: Optional[str]) -> Optional[str]:
+    """Return the canonical lowercase freshness value, or None when unset.
+
+    Raises ValueError for values outside day|week|month|year so callers can
+    surface the standard error dict instead of silently dropping the filter.
+    """
+    if value is None:
+        return None
+    normalized = str(value).strip().lower()
+    if not normalized:
+        return None
+    if normalized not in FRESHNESS_VALUES:
+        raise ValueError(
+            "Invalid freshness value: {!r}. Valid values: {}".format(value, ", ".join(FRESHNESS_VALUES))
+        )
+    return normalized
+
+
+def provider_supports_freshness(provider: str) -> bool:
+    """Return whether a provider's current API call can apply a freshness filter."""
+    return provider in PROVIDER_FRESHNESS_FORMATS
+
+
+def map_freshness_for_provider(provider: str, freshness: Optional[str]) -> Optional[str]:
+    """Translate the unified freshness value into the provider's native format."""
+    if not freshness:
+        return None
+    return PROVIDER_FRESHNESS_FORMATS.get(provider, {}).get(freshness)
+
+
+def freshness_metadata(provider: str, requested: str) -> Dict[str, Any]:
+    """Describe whether a provider applied the requested freshness filter."""
+    native = map_freshness_for_provider(provider, requested)
+    if native is not None:
+        return {"requested": requested, "applied": True, "provider": provider, "native_value": native}
+    return {
+        "requested": requested,
+        "applied": False,
+        "provider": provider,
+        "reason": "provider {} does not support freshness".format(provider),
+    }
+
+
+# =============================================================================
+# Unified search type (web vs. news vertical)
+# =============================================================================
+
+SEARCH_TYPE_VALUES = ("search", "news")
+
+# Providers whose API natively serves a Google-tab-style result vertical.
+# Maps provider -> {generic value -> native value}, mirroring
+# PROVIDER_FRESHNESS_FORMATS. Providers absent from this table always run
+# their normal web search and report search_type.applied=false in metadata.
+PROVIDER_SEARCH_TYPES: Dict[str, Dict[str, str]] = {
+    # search_serper: endpoint path https://google.serper.dev/<type>
+    "serper": {"search": "search", "news": "news"},
+}
+
+
+def normalize_search_type(value: Optional[str]) -> Optional[str]:
+    """Return the canonical lowercase search_type value, or None when unset.
+
+    Raises ValueError for values outside search|news so callers can surface
+    the standard error dict instead of silently running the wrong vertical.
+    """
+    if value is None:
+        return None
+    normalized = str(value).strip().lower()
+    if not normalized:
+        return None
+    if normalized not in SEARCH_TYPE_VALUES:
+        raise ValueError(
+            "Invalid search_type value: {!r}. Valid values: {}".format(value, ", ".join(SEARCH_TYPE_VALUES))
+        )
+    return normalized
+
+
+def provider_supports_search_type(provider: str, search_type: str) -> bool:
+    """Return whether a provider's current API call can serve the requested vertical."""
+    return search_type in PROVIDER_SEARCH_TYPES.get(provider, {})
+
+
+def search_type_metadata(provider: str, requested: str) -> Dict[str, Any]:
+    """Describe whether a provider applied the requested search type."""
+    native = PROVIDER_SEARCH_TYPES.get(provider, {}).get(requested)
+    if native is not None:
+        return {"requested": requested, "applied": True, "provider": provider, "native_value": native}
+    return {
+        "requested": requested,
+        "applied": False,
+        "provider": provider,
+        "reason": "provider {} does not support search_type {}".format(provider, requested),
+    }
 
 
 def search_serper(
@@ -67,25 +196,27 @@ def search_serper(
 
     data = make_request(endpoint, headers, body)
 
+    # /news answers carry results under "news" (title/link/snippet/date/source/
+    # imageUrl/position) instead of "organic"; reading only "organic" used to
+    # silently return zero results for serper.type="news".
+    raw_items = data.get("news", []) if search_type == "news" else data.get("organic", [])
     results = []
-    for i, item in enumerate(data.get("organic", [])[:max_results]):
-        results.append({
+    for i, item in enumerate(raw_items[:max_results]):
+        result = {
             "title": item.get("title", ""),
             "url": item.get("link", ""),
             "snippet": item.get("snippet", ""),
             "score": round(1.0 - i * 0.1, 2),
             "date": item.get("date"),
-        })
-
-    answer = ""
-    if data.get("answerBox", {}).get("answer"):
-        answer = data["answerBox"]["answer"]
-    elif data.get("answerBox", {}).get("snippet"):
-        answer = data["answerBox"]["snippet"]
-    elif data.get("knowledgeGraph", {}).get("description"):
-        answer = data["knowledgeGraph"]["description"]
-    elif results:
-        answer = results[0]["snippet"]
+        }
+        if search_type == "news":
+            if item.get("source") is not None:
+                result["source"] = item.get("source")
+            if item.get("imageUrl"):
+                result["thumbnail"] = item.get("imageUrl")
+            if item.get("position") is not None:
+                result["position"] = item.get("position")
+        results.append(result)
 
     images = []
     if include_images:
@@ -104,7 +235,6 @@ def search_serper(
         "query": query,
         "results": results,
         "images": images,
-        "answer": answer,
         "metadata": {},
         "knowledge_graph": data.get("knowledgeGraph"),
         "related_searches": [r.get("query") for r in data.get("relatedSearches", [])]
@@ -178,22 +308,11 @@ def search_serpbase(
     related_searches = [
         value for value in (_serpbase_related_search_query(item) for item in data.get("related_searches", [])) if value
     ]
-    answer = ""
-    if data.get("answer_box"):
-        answer_box = data.get("answer_box") or {}
-        answer = answer_box.get("answer") or answer_box.get("snippet") or ""
-    elif data.get("knowledge_graph"):
-        kg = data.get("knowledge_graph") or {}
-        answer = kg.get("description") or kg.get("subtitle") or ""
-    elif results:
-        answer = results[0]["snippet"]
-
     return {
         "provider": "serpbase",
         "query": query,
         "results": results,
         "images": [],
-        "answer": answer,
         "metadata": {
             "session_id": data.get("session_id"),
         },
@@ -257,20 +376,11 @@ def search_brave(
             "age": item.get("age"),
         })
 
-    answer = ""
-    if data.get("summary"):
-        answer = data.get("summary", "")
-    elif data.get("infobox", {}).get("description"):
-        answer = data["infobox"]["description"]
-    elif results:
-        answer = results[0]["snippet"]
-
     return {
         "provider": "brave",
         "query": query,
         "results": results,
         "images": [],
-        "answer": answer,
         "metadata": {},
         "mixed": data.get("mixed"),
     }
@@ -296,7 +406,7 @@ def search_tavily(
         "search_depth": depth,
         "topic": topic,
         "include_images": include_images,
-        "include_answer": True,
+        "include_answer": False,
         "include_raw_content": include_raw_content,
     }
 
@@ -306,6 +416,7 @@ def search_tavily(
         body["exclude_domains"] = exclude_domains
 
     headers = {"Content-Type": "application/json"}
+    validate_outbound_body("tavily", body)
 
     data = make_request(endpoint, headers, body)
 
@@ -326,7 +437,6 @@ def search_tavily(
         "query": query,
         "results": results,
         "images": data.get("images", []),
-        "answer": data.get("answer", ""),
         "metadata": {},
     }
 
@@ -418,14 +528,11 @@ def search_querit(
             result["language"] = item["language"]
         results.append(result)
 
-    answer = results[0]["snippet"] if results else ""
-
     return {
         "provider": "querit",
         "query": query,
         "results": results,
         "images": [],
-        "answer": answer,
         "metadata": {
             "search_id": data.get("search_id"),
             "time_range": querit_time_range,
@@ -454,6 +561,7 @@ def search_linkup(
     if exclude_domains:
         body["excludeDomains"] = exclude_domains[:50]
 
+    validate_outbound_body("linkup", body)
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
@@ -484,7 +592,6 @@ def search_linkup(
         "query": query,
         "results": results,
         "images": data.get("images", []),
-        "answer": data.get("answer", ""),
         "metadata": {
             "depth": depth,
             "output_type": output_type,
@@ -583,13 +690,11 @@ def search_firecrawl(
         if image_url:
             images.append(image_url)
 
-    answer = results[0]["snippet"] if results else ""
     return {
         "provider": "firecrawl",
         "query": query,
         "results": results,
         "images": images,
-        "answer": answer,
         "warning": data.get("warning"),
         "credits_used": data.get("creditsUsed"),
         "metadata": {
@@ -856,14 +961,15 @@ def extract_parallel(
     api_url: str = "https://api.parallel.ai/v1/extract",
     timeout: int = 60,
     client_model: Optional[str] = None,
-    max_chars_total: int = 12000,
-    max_chars_per_result: int = 6000,
+    max_chars_total: int = 120000,
+    max_chars_per_result: int = 60000,
 ) -> dict:
     """Extract URL content using Parallel Extract.
 
-    Parallel returns excerpts by default; request full_content explicitly and
-    normalize it into the common markdown/content shape. HTML/raw-image options
-    are accepted for tool compatibility but ignored when unsupported upstream.
+    Parallel returns excerpts by default; request full_content explicitly with a
+    peer-level character budget so long pages are not unfairly truncated versus
+    other extraction providers. HTML/raw-image options are accepted for tool
+    compatibility but ignored when unsupported upstream.
     """
     headers = {"x-api-key": api_key, "Content-Type": "application/json"}
     body: Dict[str, Any] = {
@@ -921,14 +1027,10 @@ def search_exa(
     exclude_domains: Optional[List[str]] = None,
     text_verbosity: str = "standard",
 ) -> dict:
-    """Search using Exa (Neural/Semantic/Deep Search).
-
-    exa_depth controls synthesis level:
-      - "normal": standard search (neural/fast/auto/keyword/instant)
-      - "deep": multi-source synthesis with grounding (4-12s, $12/1k)
-      - "deep-reasoning": cross-reference reasoning with grounding (12-50s, $15/1k)
-    """
-    is_deep = exa_depth in ("deep", "deep-reasoning")
+    """Search Exa's source-result endpoint; synthesis modes are charter-banned."""
+    if exa_depth in {"deep", "deep-reasoning"}:
+        raise ValueError("exa deep modes are not source-only")
+    validate_provider_mode("exa", "search")
 
     if similar_url:
         # findSimilar does not support deep search types
@@ -939,16 +1041,6 @@ def search_exa(
             "contents": {
                 "text": {"maxCharacters": 2000, "verbosity": text_verbosity},
                 "highlights": {"numSentences": 3, "highlightsPerUrl": 2},
-            },
-        }
-    elif is_deep:
-        endpoint = "https://api.exa.ai/search"
-        body = {
-            "query": query,
-            "numResults": max_results,
-            "type": exa_depth,
-            "contents": {
-                "text": {"maxCharacters": 5000, "verbosity": "full"},
             },
         }
     else:
@@ -979,75 +1071,12 @@ def search_exa(
         "Content-Type": "application/json",
     }
 
-    timeout = 55 if is_deep else 30
-    data = make_request(endpoint, headers, body, timeout=timeout)
+    validate_outbound_body("exa", body)
+    data = make_request(endpoint, headers, body, timeout=30)
 
     results = []
 
-    # Deep search: primary content in output field with grounding citations
-    if is_deep:
-        deep_output = data.get("output", {})
-        synthesized_text = ""
-        grounding_citations: List[Dict[str, Any]] = []
-
-        if isinstance(deep_output.get("content"), str):
-            synthesized_text = deep_output["content"]
-        elif isinstance(deep_output.get("content"), dict):
-            synthesized_text = json.dumps(deep_output["content"], ensure_ascii=False)
-
-        for field_citation in deep_output.get("grounding", []):
-            for cite in field_citation.get("citations", []):
-                grounding_citations.append({
-                    "url": cite.get("url", ""),
-                    "title": cite.get("title", ""),
-                    "confidence": field_citation.get("confidence", ""),
-                    "field": field_citation.get("field", ""),
-                })
-
-        # Primary synthesized result
-        if synthesized_text:
-            results.append({
-                "title": f"Exa {exa_depth.replace('-', ' ').title()} Synthesis",
-                "url": "",
-                "snippet": synthesized_text,
-                "full_synthesis": synthesized_text,
-                "score": 1.0,
-                "grounding": grounding_citations[:10],
-                "type": "synthesis",
-            })
-
-        # Supporting source documents
-        for item in data.get("results", [])[:max_results]:
-            text_content = item.get("text", "") or ""
-            highlights = item.get("highlights", [])
-            snippet = text_content[:800] if text_content else (highlights[0] if highlights else "")
-            results.append({
-                "title": item.get("title", ""),
-                "url": item.get("url", ""),
-                "snippet": snippet,
-                "score": round(item.get("score", 0.0), 3),
-                "published_date": item.get("publishedDate"),
-                "author": item.get("author"),
-                "type": "source",
-            })
-
-        answer = synthesized_text if synthesized_text else (results[1]["snippet"] if len(results) > 1 else "")
-
-        return {
-            "provider": "exa",
-            "query": query,
-            "exa_depth": exa_depth,
-            "results": results,
-            "images": [],
-            "answer": answer,
-            "grounding": grounding_citations,
-            "metadata": {
-                "synthesis_length": len(synthesized_text),
-                "source_count": len(data.get("results", [])),
-            },
-        }
-
-    # Standard search result parsing
+    # Standard source-result parsing
     for item in data.get("results", [])[:max_results]:
         text_content = item.get("text", "") or ""
         highlights = item.get("highlights", [])
@@ -1067,14 +1096,11 @@ def search_exa(
             "author": item.get("author"),
         })
 
-    answer = results[0]["snippet"] if results else ""
-
     return {
         "provider": "exa",
         "query": query if not similar_url else f"Similar to: {similar_url}",
         "results": results,
         "images": [],
-        "answer": answer,
         "metadata": {},
     }
 
@@ -1130,13 +1156,12 @@ def search_parallel(
             "excerpts": excerpts,
         })
 
-    answer = " ".join(r.get("snippet", "") for r in results[:3])[:1200]
+    " ".join(r.get("snippet", "") for r in results[:3])[:1200]
     return {
         "provider": "parallel",
         "query": query,
         "results": results,
         "images": [],
-        "answer": answer,
         "metadata": {
             "search_id": data.get("search_id"),
             "session_id": data.get("session_id"),
@@ -1153,95 +1178,11 @@ def search_perplexity(
     freshness: Optional[str] = None,
     provider_name: str = "perplexity",
 ) -> dict:
-    """Search/answer using the native Perplexity API or a compatible gateway.
+    """Reject legacy chat-completion providers before any network I/O."""
+    del query, api_key, max_results, model, api_url, freshness
+    validate_provider_mode(provider_name, "search")
+    raise ValueError(f"{provider_name} has no verified source-only endpoint")
 
-    Args:
-        query: Search query
-        api_key: Provider API key
-        max_results: Maximum results to return
-        model: Perplexity-compatible model to use
-        api_url: Chat completions endpoint
-        freshness: Filter by recency — 'day', 'week', 'month', 'year' (maps to
-                   Perplexity's search_recency_filter parameter)
-        provider_name: Result provider label (perplexity or kilo-perplexity)
-    """
-    # Map generic freshness values to Perplexity's search_recency_filter
-    recency_map = {"day": "day", "pd": "day", "week": "week", "pw": "week", "month": "month", "pm": "month", "year": "year", "py": "year"}
-    recency_filter = recency_map.get(freshness or "", None)
-
-    body = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": "Answer with concise factual summary and include source URLs."},
-            {"role": "user", "content": query},
-        ],
-        "temperature": 0.2,
-    }
-    if recency_filter:
-        body["search_recency_filter"] = recency_filter
-
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-
-    data = make_request(api_url, headers, body)
-    choices = data.get("choices", [])
-    message = choices[0].get("message", {}) if choices else {}
-    answer = (message.get("content") or "").strip()
-
-    # Prefer the structured citations array from Perplexity API response
-    api_citations = data.get("citations", [])
-
-    # Fallback: extract URLs from answer text if API doesn't provide citations
-    if not api_citations:
-        api_citations = []
-        seen = set()
-        for u in re.findall(r"https?://[^\s)\]}>\"']+", answer):
-            if u not in seen:
-                seen.add(u)
-                api_citations.append(u)
-
-    results = []
-
-    # Primary result: the synthesized answer itself
-    if answer:
-        # Clean citation markers [1][2] for the snippet
-        clean_answer = re.sub(r'\[\d+\]', '', answer).strip()
-        results.append({
-            "title": f"Perplexity Answer: {query[:80]}",
-            "url": "https://www.perplexity.ai",
-            "snippet": clean_answer[:500],
-            "score": 1.0,
-        })
-
-    # Source results from citations
-    for i, citation in enumerate(api_citations[:max_results - 1]):
-        # citations can be plain URL strings or dicts with url/title
-        if isinstance(citation, str):
-            url = citation
-            title = _title_from_url(url)
-        else:
-            url = citation.get("url", "")
-            title = citation.get("title") or _title_from_url(url)
-        results.append({
-            "title": title,
-            "url": url,
-            "snippet": f"Source cited in Perplexity answer [citation {i+1}]",
-            "score": round(0.9 - i * 0.1, 3),
-        })
-
-    return {
-        "provider": provider_name,
-        "query": query,
-        "results": results,
-        "images": [],
-        "answer": answer,
-        "metadata": {
-            "model": model,
-            "usage": data.get("usage", {}),
-        }
-    }
 
 def search_you(
     query: str,
@@ -1328,9 +1269,9 @@ def search_you(
         raise ProviderRequestError(f"{friendly_msg} (HTTP {e.code})", status_code=e.code, transient=e.code in TRANSIENT_HTTP_CODES)
     except URLError as e:
         reason = str(getattr(e, "reason", e))
-        is_timeout = "timed out" in reason.lower()
+        is_timeout = isinstance(getattr(e, "reason", None), socket.timeout) or "timed out" in reason.lower()
         raise ProviderRequestError(f"Network error: {reason}. Check your internet connection.", transient=is_timeout)
-    except TimeoutError:
+    except (TimeoutError, socket.timeout):
         raise ProviderRequestError("You.com request timed out after 30s.", transient=True)
 
     # Parse results
@@ -1382,23 +1323,12 @@ def search_you(
             "source": "news",
         })
 
-    # Build answer from best snippets
-    answer = ""
-    if results:
-        # Combine top snippets for LLM context
-        top_snippets = []
-        for r in results[:3]:
-            if r.get("snippet"):
-                top_snippets.append(r["snippet"])
-        answer = " ".join(top_snippets)[:1000]
-
     return {
         "provider": "you",
         "query": query,
         "results": results,
         "news": news,
         "images": [],
-        "answer": answer,
         "metadata": {
             "search_uuid": metadata.get("search_uuid"),
             "latency": metadata.get("latency"),
@@ -1487,9 +1417,9 @@ def search_searxng(
         raise ProviderRequestError(f"{friendly_msg} (HTTP {e.code})", status_code=e.code, transient=e.code in TRANSIENT_HTTP_CODES)
     except URLError as e:
         reason = str(getattr(e, "reason", e))
-        is_timeout = "timed out" in reason.lower()
+        is_timeout = isinstance(getattr(e, "reason", None), socket.timeout) or "timed out" in reason.lower()
         raise ProviderRequestError(f"Cannot reach SearXNG instance at {instance_url}. Error: {reason}", transient=is_timeout)
-    except TimeoutError:
+    except (TimeoutError, socket.timeout):
         raise ProviderRequestError("SearXNG request timed out after 30s. Check instance health.", transient=True)
 
     # Parse results
@@ -1512,22 +1442,11 @@ def search_searxng(
             "date": item.get("publishedDate"),
         })
 
-    # Build answer from answers, infoboxes, or first result
-    answer = ""
-    if data.get("answers"):
-        answer = data["answers"][0] if isinstance(data["answers"][0], str) else str(data["answers"][0])
-    elif data.get("infoboxes"):
-        infobox = data["infoboxes"][0]
-        answer = infobox.get("content", "") or infobox.get("infobox", "")
-    elif results:
-        answer = results[0]["snippet"]
-
     return {
         "provider": "searxng",
         "query": query,
         "results": results,
         "images": [],
-        "answer": answer,
         "suggestions": data.get("suggestions", []),
         "corrections": data.get("corrections", []),
         "metadata": {
@@ -1538,147 +1457,168 @@ def search_searxng(
     }
 
 
-def search_anysearch(
-    query: str,
-    api_key: str = "",
-    max_results: int = 5,
-    zone: str = "intl",
-    language: str = "en",
-    time_range: Optional[str] = None,
-) -> dict:
-    """Search using AnySearch AI-native search API.
+_KEENABLE_TIME_RANGE = {"hour": "1h", "day": "1d", "week": "7d", "month": "1mo", "year": "1y"}
 
-    AnySearch is an AI-native search infrastructure with 22 vertical domains
-    and 1,000 free anonymous searches/day.
-    """
-    endpoint = "https://api.anysearch.com/v1/search"
 
-    body: Dict[str, Any] = {
-        "query": query,
-        "max_results": max_results,
-    }
+_KEENABLE_PUBLIC_WARNED = False
 
-    if zone:
-        body["zone"] = zone
-    if language:
-        body["language"] = language
-    if time_range and time_range != "none":
-        body["constraint"] = {"freshness": time_range}
 
-    headers = {
-        "Content-Type": "application/json",
-        "User-Agent": DEFAULT_USER_AGENT,
-    }
+def _warn_keenable_public_once() -> None:
+    global _KEENABLE_PUBLIC_WARNED
+    if _KEENABLE_PUBLIC_WARNED:
+        return
+    _KEENABLE_PUBLIC_WARNED = True
+    print(json.dumps({
+        "warning": (
+            "Keenable keyless public endpoint in use: queries and fetched URLs are sent "
+            "to an unauthenticated shared service (https://keenable.ai) with no SLA. "
+            "Set KEENABLE_API_KEY for the authenticated endpoint."
+        )
+    }), file=sys.stderr)
+
+
+def _keenable_endpoint(api_url: str, api_key: Optional[str], public: bool) -> tuple:
+    """Return (endpoint, headers). A present key always uses the authenticated route;
+    with no key, the keyless /public route is used when public is enabled."""
+    headers = {"X-Keenable-Title": "hermes-web-search-plus"}
     if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
+        headers["X-API-Key"] = api_key
+        return api_url, headers
+    if public:
+        _warn_keenable_public_once()
+        return f"{api_url}/public", headers
+    raise ValueError("Keenable requires an API key or an enabled public endpoint")
 
-    data = make_request(endpoint, headers, body)
 
-    # Unwrap AnySearch response envelope: {"code":0, "data":{"results":[...]}}
-    payload = data.get("data", data)
-    raw_results = payload.get("results", [])
+def search_keenable(
+    query: str,
+    api_key: Optional[str] = None,
+    max_results: int = 5,
+    time_range: Optional[str] = None,
+    include_domains: Optional[List[str]] = None,
+    public: bool = False,
+    api_url: str = "https://api.keenable.ai/v1/search",
+    timeout: int = 30,
+) -> dict:
+    """Search using Keenable's independent web index.
+
+    Uses the authenticated endpoint when api_key is set; with no key, public=True
+    selects the keyless /public endpoint.
+    """
+    body: Dict[str, Any] = {"query": query}
+    if time_range and time_range in _KEENABLE_TIME_RANGE:
+        body["published_after"] = _KEENABLE_TIME_RANGE[time_range]
+    if include_domains:
+        body["site"] = include_domains[0]
+
+    url, headers = _keenable_endpoint(api_url, api_key, public)
+    headers["Content-Type"] = "application/json"
+
+    data = make_request(url, headers, body, timeout=timeout)
     results = []
-    for i, item in enumerate(raw_results[:max_results]):
-        snippet = item.get("snippet") or item.get("description") or item.get("content", "")
+    for i, item in enumerate(data.get("results", [])[:max_results]):
+        item_url = item.get("url", "")
         results.append({
-            "title": item.get("title", ""),
-            "url": item.get("url", ""),
-            "snippet": snippet,
-            "content": item.get("content", ""),
-            "score": round(item.get("score") or item.get("quality_score") or (1.0 - i * 0.1), 2),
+            "title": item.get("title") or _title_from_url(item_url),
+            "url": item_url,
+            "snippet": item.get("snippet") or item.get("description", ""),
+            "score": round(1.0 - i * 0.05, 3),
             "date": item.get("published_at"),
-            "source": item.get("source", "web"),
+            "acquired_at": item.get("acquired_at"),
         })
 
-    answer = ""
-    if raw_results:
-        best = raw_results[0]
-        answer = best.get("content") or best.get("snippet") or best.get("description", "")
-        if not answer:
-            answer = results[0]["snippet"]
-
     return {
-        "provider": "anysearch",
+        "provider": "keenable",
         "query": query,
         "results": results,
         "images": [],
-        "answer": answer,
-        "metadata": {
-            "code": data.get("code"),
-            "message": data.get("message"),
-        },
+        "metadata": {"number_of_results": data.get("number_of_results")},
     }
 
 
-def extract_anysearch(
+def extract_keenable(
     urls: List[str],
-    api_key: str = "",
+    api_key: Optional[str] = None,
     output_format: str = "markdown",
     include_images: bool = False,
     include_raw_html: bool = False,
     render_js: bool = False,
-    api_url: str = "https://api.anysearch.com/mcp",
-    timeout: int = 60,
+    public: bool = False,
+    api_url: str = "https://api.keenable.ai/v1/fetch",
+    timeout: int = 30,
 ) -> dict:
-    """Extract URL content via AnySearch MCP extract tool.
+    """Extract page content via Keenable's fetch endpoint (clean markdown).
 
-    AnySearch extract uses the MCP JSON-RPC endpoint since there is no
-    dedicated REST extract endpoint.
+    Uses the authenticated endpoint when api_key is set; with no key, public=True
+    selects the keyless /public endpoint.
     """
-    headers = {
-        "Content-Type": "application/json",
-        "User-Agent": DEFAULT_USER_AGENT,
-    }
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
+    base_url, headers = _keenable_endpoint(api_url, api_key, public)
 
     results: List[Dict[str, Any]] = []
     for url in urls:
         try:
-            rpc_body = {
-                "jsonrpc": "2.0",
-                "method": "tools/call",
-                "params": {
-                    "name": "extract",
-                    "arguments": {"url": url},
-                },
-                "id": 1,
-            }
-            data = make_request(api_url, headers, rpc_body, timeout=timeout)
-
-            # Unwrap JSON-RPC response
-            rpc_result = data
-            if "result" in data:
-                rpc_result = data["result"]
-            if isinstance(rpc_result, dict) and "content" in rpc_result:
-                # MCP tool result: content is an array of content blocks
-                content_blocks = rpc_result.get("content", [])
-                text_parts = []
-                for block in content_blocks:
-                    if isinstance(block, dict) and block.get("type") == "text":
-                        text_parts.append(block.get("text", ""))
-                markdown = "\n".join(text_parts)
-                title = ""
-                results.append(_normalize_extract_result(
-                    "anysearch", url,
-                    title=title,
-                    content=markdown,
-                    raw_content=markdown,
-                ))
-            elif isinstance(rpc_result, dict) and rpc_result.get("error"):
-                results.append(_normalize_extract_result(
-                    "anysearch", url,
-                    error=str(rpc_result["error"]),
-                ))
-            else:
-                results.append(_normalize_extract_result(
-                    "anysearch", url,
-                    content=str(rpc_result),
-                ))
-        except Exception as exc:
+            endpoint = f"{base_url}?url={quote(url, safe='')}"
+            data = make_get_request(endpoint, headers, timeout=timeout)
+            content = data.get("content") or ""
             results.append(_normalize_extract_result(
-                "anysearch", url,
-                error=str(exc),
+                "keenable",
+                data.get("url") or url,
+                title=data.get("title", ""),
+                content=content,
+                raw_content=content,
+                author=data.get("author"),
+                description=data.get("description"),
             ))
+        except Exception as e:
+            results.append(_normalize_extract_result("keenable", url, error=str(e)))
+    return {"provider": "keenable", "results": results}
 
-    return {"provider": "anysearch", "results": results}
+
+def extract_serper(
+    urls: List[str],
+    api_key: str,
+    output_format: str = "markdown",
+    include_images: bool = False,
+    include_raw_html: bool = False,
+    render_js: bool = False,
+    api_url: str = "https://scrape.serper.dev",
+    timeout: int = 30,
+) -> dict:
+    """Extract page content via Serper's webpage scraper.
+
+    Request/response shape verified against Serper API clients: POST
+    ``{"url": ..., "includeMarkdown": true}`` with the X-API-KEY header;
+    the answer carries ``text`` plus optional ``markdown``, ``metadata``,
+    ``jsonld`` and ``credits``. The endpoint accepts one URL per call, so
+    multi-URL requests loop with per-URL error items (extract_keenable
+    pattern). The scraper returns no raw HTML; html/raw-html/render-js
+    options are accepted for tool compatibility but have no upstream effect.
+    The endpoint is operator-overridable via config ``serper.scrape_url``.
+    """
+    headers = {"X-API-KEY": api_key, "Content-Type": "application/json"}
+    results: List[Dict[str, Any]] = []
+    for url in urls:
+        try:
+            data = make_request(api_url, headers, {"url": url, "includeMarkdown": True}, timeout=timeout)
+            if data.get("error"):
+                results.append(_normalize_extract_result("serper", url, error=str(data.get("error"))))
+                continue
+            # Field names are parsed tolerantly in case Serper renames them.
+            markdown = data.get("markdown") or ""
+            text = data.get("text") or data.get("content") or ""
+            content = markdown or text
+            metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+            title = metadata.get("title") or data.get("title") or ""
+            results.append(_normalize_extract_result(
+                "serper",
+                url,
+                title=title,
+                content=content,
+                raw_content=content,
+                metadata=metadata or None,
+                jsonld=data.get("jsonld"),
+                credits=data.get("credits"),
+            ))
+        except Exception as e:
+            results.append(_normalize_extract_result("serper", url, error=str(e)))
+    return {"provider": "serper", "results": results}

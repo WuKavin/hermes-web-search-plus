@@ -1,5 +1,5 @@
 name: web-search-plus
-version: "2.5.1"
+version: "3.3.0"
 description: "Multi-provider web search, URL extraction, quality reports, and opt-in research mode"
 author: robbyczgw-cla
 requires_env: []
@@ -9,14 +9,15 @@ optional_env:
   - BRAVE_API_KEY
   - TAVILY_API_KEY
   - EXA_API_KEY
+  - ANYSEARCH_API_KEY
   - QUERIT_API_KEY
   - LINKUP_API_KEY
   - FIRECRAWL_API_KEY
-  - PERPLEXITY_API_KEY
-  - KILOCODE_API_KEY
   - YOU_API_KEY
   - PARALLEL_API_KEY
   - SEARXNG_INSTANCE_URL
+  - KEENABLE_API_KEY
+  - HOUND_MCP_URL
 provides_tools:
   - web_search_plus
   - web_extract_plus
@@ -25,18 +26,19 @@ provides_hooks:
 onboarding:
   setup_command: "python ~/.hermes/plugins/web-search-plus/setup.py setup"
   status_command: "python ~/.hermes/plugins/web-search-plus/setup.py status"
+  fastpath_status_command: "python ~/.hermes/plugins/web-search-plus/setup.py fastpath"
   routing_status_command: "python ~/.hermes/plugins/web-search-plus/setup.py config show"
   routing_config_commands:
     fixed_provider: "python ~/.hermes/plugins/web-search-plus/setup.py config set-default you"
     auto_routing: "python ~/.hermes/plugins/web-search-plus/setup.py config set-routing on"
     priority: "python ~/.hermes/plugins/web-search-plus/setup.py config set-priority you,serper,exa,firecrawl,tavily,linkup,parallel"
     fallback: "python ~/.hermes/plugins/web-search-plus/setup.py config set-fallback serper"
-    disable_provider: "python ~/.hermes/plugins/web-search-plus/setup.py config disable perplexity"
+    disable_provider: "python ~/.hermes/plugins/web-search-plus/setup.py config disable brave"
     block_auto_provider: "python ~/.hermes/plugins/web-search-plus/setup.py config set-auto-allow brave off"
     reset: "python ~/.hermes/plugins/web-search-plus/setup.py config reset --yes"
   config_file: "~/.hermes/plugins/config.json"
   env_override: "WEB_SEARCH_PLUS_CONFIG"
-  note: "No single provider key is globally required. Add at least one search-capable provider for web_search_plus; add Linkup or another extraction-capable provider for web_extract_plus. Setup keys live in .env; routing preferences live in config.json and can choose fixed-provider mode or tuned auto-routing without relying on unreleased Hermes core plugin-CLI support."
+  note: "No single provider key is globally required. Add at least one search-capable provider for web_search_plus; add Linkup or another extraction-capable provider for web_extract_plus. Setup keys live in .env; routing preferences live in config.json and can choose fixed-provider mode or tuned auto-routing without relying on unreleased Hermes core plugin-CLI support. Use setup.py fastpath to inspect advisory Hermes config hints for lower-latency direct tool routing."
   recommended_env:
     - name: YOU_API_KEY
       description: "You.com — fast Routing v2 core provider"

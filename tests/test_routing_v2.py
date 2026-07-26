@@ -15,16 +15,16 @@ def _route(query):
         return search.QueryAnalyzer(config).route(query)
 
 
-def test_default_auto_allow_blocks_unreliable_and_answer_only_providers():
+def test_default_auto_allow_blocks_explicit_only_providers():
     config = search._deepcopy_default_config()
 
     auto_allow = config["auto_routing"]["auto_allow"]
 
     assert auto_allow["serpbase"] is False
     assert auto_allow["querit"] is False
-    assert auto_allow["brave"] is False
-    assert auto_allow["kilo-perplexity"] is False
-    assert auto_allow["perplexity"] is False
+    assert auto_allow["parallel"] is False
+    assert auto_allow.get("brave", True) is True
+
 
 
 def test_legacy_auto_allow_config_inherits_new_guarded_provider_defaults():
@@ -33,9 +33,9 @@ def test_legacy_auto_allow_config_inherits_new_guarded_provider_defaults():
 
     validated = search._validate_runtime_config(config)
 
-    assert validated["auto_routing"]["auto_allow"]["brave"] is False
-    assert validated["auto_routing"]["auto_allow"]["kilo-perplexity"] is False
-    assert validated["auto_routing"]["auto_allow"]["perplexity"] is False
+    assert validated["auto_routing"]["auto_allow"].get("brave", True) is True
+    assert validated["auto_routing"]["auto_allow"]["parallel"] is False
+
 
 
 def test_briefing_synthesis_overrides_docs_keywords():
@@ -191,6 +191,14 @@ def test_domain_rule_does_not_substring_match_middle_of_domain():
     assert search._domain_matches_rule("mirror.com", "ir.") is False
 
 
+def test_domain_rule_rejects_lookalike_registrations():
+    # A look-alike domain must not inherit the boost of the real one.
+    assert search._domain_matches_rule("openai.com.evil.example", "openai.com") is False
+    assert search._domain_matches_rule("github.community-fake.xyz", "github.com") is False
+    assert search._domain_matches_rule("openai.com", "openai.com") is True
+    assert search._domain_matches_rule("platform.openai.com", "openai.com") is True
+
+
 def test_reddit_company_finance_query_is_not_community_query():
     routing = _route("Reddit IPO earnings revenue investor relations")
 
@@ -209,7 +217,7 @@ def test_multilingual_current_japanese_routes_to_you_not_brave_or_serper():
     assert routing["provider"] == "you"
     assert routing["routing_policy"] == "routing-v2"
     assert routing["analysis_summary"]["language_hint"] == "ja"
-    assert "brave" in routing["auto_allow_excluded"]
+    assert "brave" not in routing["auto_allow_excluded"]
 
 
 def test_multilingual_arabic_routes_to_you_and_blocks_querit():
@@ -225,6 +233,54 @@ def test_arxiv_academic_routes_to_exa():
 
     assert routing["provider"] == "exa"
     assert routing["analysis_summary"]["routing_class"] == "academic_arxiv"
+
+
+def test_anysearch_is_scored_for_general_queries():
+    routing = _route("OpenCode")
+
+    assert routing["provider"] == "anysearch"
+    assert routing["scores"]["anysearch"] > routing["scores"]["tavily"]
+
+
+def test_chinese_query_is_not_misclassified_as_japanese():
+    routing = _route("今日中国新闻")
+
+    assert routing["analysis_summary"]["language_hint"] == "zh"
+    assert routing["provider"] == "anysearch"
+
+
+def test_anysearch_wins_high_value_vertical_queries_without_specialist_keys():
+    config = search._deepcopy_default_config()
+
+    def configured(provider, _config=None):
+        return provider in {"anysearch", "brave", "tavily", "exa"}
+
+    with mock.patch.object(search, "provider_configured", side_effect=configured):
+        routes = {
+            query: search.QueryAnalyzer(config).route(query)["provider"]
+            for query in (
+                "CVE-2026-1234 OpenSSL vulnerability advisory",
+                "patent US20240010196",
+                "NVIDIA Q4 earnings revenue investor relations",
+                "量子纠缠学术论文",
+            )
+        }
+
+    assert set(routes.values()) == {"anysearch"}
+
+
+def test_brave_is_in_default_auto_pool_and_wins_shopping_news():
+    config = search._deepcopy_default_config()
+
+    with mock.patch.object(
+        search,
+        "provider_configured",
+        side_effect=lambda provider, _config=None: provider in {"brave", "tavily", "exa", "anysearch"},
+    ):
+        routing = search.QueryAnalyzer(config).route("latest iPhone 16 price today")
+
+    assert config["auto_routing"]["auto_allow"].get("brave", True) is True
+    assert routing["provider"] == "brave"
 
 
 def test_reddit_site_query_routes_away_from_exa():
@@ -248,4 +304,4 @@ def test_synthesis_query_routes_to_you_without_auto_selecting_kilo():
 
     assert routing["provider"] == "you"
     assert "answer_mode_recommended" not in routing
-    assert "kilo-perplexity" in routing["auto_allow_excluded"]
+    assert "kilo-perplexity" not in routing["scores"]

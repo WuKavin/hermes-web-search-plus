@@ -1,11 +1,11 @@
 """
-web-search-plus — Hermes Plugin v2.5.0
+web-search-plus — Hermes Plugin v3.3.0
 Multi-provider web search, URL extraction, quality reports, and opt-in research mode.
 Ported from robbyczgw-cla/web-search-plus-plugin (OpenClaw) to Hermes Plugin API.
 """
 from __future__ import annotations
 
-__version__ = "2.5.1"
+__version__ = "3.3.0"
 
 import argparse
 import getpass
@@ -13,6 +13,7 @@ import importlib.util
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -23,27 +24,54 @@ import webbrowser
 from concurrent.futures import TimeoutError as FuturesTimeout
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional
+from urllib.parse import urlparse
+
+# Hermes standalone plugin discovery can execute this flat plugin from outside
+# the plugin directory. Keep sibling-module fallback imports cwd-independent
+# without shadowing host/other-plugin modules ahead of normal sys.path entries.
+_PLUGIN_DIR = Path(__file__).resolve().parent
+if str(_PLUGIN_DIR) not in sys.path:
+    sys.path.append(str(_PLUGIN_DIR))
 
 try:  # Package load path used by Hermes plugin discovery.
     from .provider_registry import (
         DEFAULT_AUTO_ALLOW,
         DEFAULT_PROVIDER_PRIORITY,
         EXTRACT_PROVIDER_ENV_KEYS,
+        EXTRACT_PROVIDER_IDS,
+        KEYLESS_EXTRACT_PROVIDER_IDS,
+        KEYLESS_PROVIDER_IDS,
         PROVIDER_ENV_KEYS,
         PROVIDER_SPECS,
+        PROVIDER_STARTUP_DIAGNOSTICS,
+        SEARCH_PROVIDER_IDS,
+        keyless_public_env_var,
         plugin_catalog,
     )
-    from .env_loader import clean_env_value as _shared_clean_env_value, get_hermes_env_path, load_env_files
+    from .env_loader import clean_env_value as _shared_clean_env_value, get_hermes_env_path, is_truthy, load_env_files
+    from .cache import MAX_STORED_TEXT_CHARS, store_web_text
+    from .config import (
+        apply_profile_effects,
+        load_config,
+    )
 except ImportError:  # Direct script/test imports from the plugin directory.
     from provider_registry import (
         DEFAULT_AUTO_ALLOW,
         DEFAULT_PROVIDER_PRIORITY,
         EXTRACT_PROVIDER_ENV_KEYS,
+        EXTRACT_PROVIDER_IDS,
+        KEYLESS_EXTRACT_PROVIDER_IDS,
+        KEYLESS_PROVIDER_IDS,
         PROVIDER_ENV_KEYS,
         PROVIDER_SPECS,
+        PROVIDER_STARTUP_DIAGNOSTICS,
+        SEARCH_PROVIDER_IDS,
+        keyless_public_env_var,
         plugin_catalog,
     )
-    from env_loader import clean_env_value as _shared_clean_env_value, get_hermes_env_path, load_env_files
+    from env_loader import clean_env_value as _shared_clean_env_value, get_hermes_env_path, is_truthy, load_env_files
+    from cache import MAX_STORED_TEXT_CHARS, store_web_text
+    from config import apply_profile_effects, load_config
 
 try:
     from .daemon_tasks import DaemonTask
@@ -54,6 +82,8 @@ _SEARCH_SCRIPT = Path(__file__).parent / "search.py"
 _TOOLSET_NAME = "web-search-plus"
 _PROVIDER_ENV_KEYS = list(PROVIDER_ENV_KEYS)
 _EXTRACT_PROVIDER_ENV_KEYS = list(EXTRACT_PROVIDER_ENV_KEYS)
+_KEYLESS_EXTRACT_PROVIDER_IDS = list(KEYLESS_EXTRACT_PROVIDER_IDS)
+_KEYLESS_PROVIDER_IDS = list(KEYLESS_PROVIDER_IDS)
 
 logger = logging.getLogger(__name__)
 
@@ -84,7 +114,7 @@ def _read_env_file(path: Path) -> Dict[str, str]:
     values: Dict[str, str] = {}
     if not path.exists():
         return values
-    for line in path.read_text().splitlines():
+    for line in path.read_text(encoding="utf-8").splitlines():
         stripped = line.strip()
         if not stripped or stripped.startswith("#") or "=" not in stripped:
             continue
@@ -132,6 +162,10 @@ def _provider_config_status(env: Optional[Mapping[str, str]] = None) -> Dict[str
         "configured_extract_count": configured_extract_count,
         "total": len(_PROVIDER_CATALOG),
         "providers": providers,
+        "startup_diagnostics": [
+            {"module": diagnostic.module, "code": diagnostic.code}
+            for diagnostic in PROVIDER_STARTUP_DIAGNOSTICS
+        ],
     }
 
 
@@ -144,6 +178,7 @@ def _get_hermes_env_path() -> Path:
 
 _SETUP_PROVIDER_NAMES = set(PROVIDER_SPECS)
 _DEFAULT_PROVIDER_PRIORITY = list(DEFAULT_PROVIDER_PRIORITY)
+_DEFAULT_EXTRACT_PROVIDER_PRIORITY = list(EXTRACT_PROVIDER_IDS)
 _DEFAULT_AUTO_ALLOW = dict(DEFAULT_AUTO_ALLOW)
 _ROUTING_PROVIDER_NAMES = set(PROVIDER_SPECS)
 
@@ -156,14 +191,188 @@ def _get_plugin_config_path() -> Path:
     return Path(__file__).parent.parent / "config.json"
 
 
+def _get_hermes_config_path() -> Path:
+    """Return the default Hermes config path inspected by the fast-path doctor."""
+    return Path(os.environ.get("HERMES_CONFIG", Path.home() / ".hermes" / "config.yaml"))
+
+
+def _yamlish_has_list_item(text: str, key: str, item: str) -> bool:
+    """Tiny dependency-free YAML-ish list checker for Hermes config hints.
+
+    This intentionally avoids PyYAML because the setup helper is stdlib-only. It
+    handles the two forms users normally write in config.yaml:
+
+    - key: [a, b]
+    - key:
+      - a
+      - b
+    """
+    escaped_key = re.escape(key)
+    escaped_item = re.escape(item)
+    inline = re.search(rf"(?m)^\s*{escaped_key}\s*:\s*\[[^\]]*\b{escaped_item}\b", text)
+    if inline:
+        return True
+
+    lines = text.splitlines()
+    for idx, line in enumerate(lines):
+        match = re.match(rf"^(\s*){escaped_key}\s*:\s*$", line)
+        if not match:
+            continue
+        base_indent = len(match.group(1))
+        for child in lines[idx + 1:]:
+            if not child.strip() or child.lstrip().startswith("#"):
+                continue
+            indent = len(child) - len(child.lstrip())
+            is_list_item = child.lstrip().startswith("-")
+            if indent < base_indent or (indent == base_indent and not is_list_item):
+                break
+            if re.match(rf"^\s*-\s*{escaped_item}\s*(?:#.*)?$", child):
+                return True
+    return False
+
+
+def _yamlish_nested_list_item(text: str, parent: str, key: str, item: str) -> bool:
+    """Best-effort check for parent.key containing item in simple YAML config."""
+    escaped_parent = re.escape(parent)
+    escaped_key = re.escape(key)
+    escaped_item = re.escape(item)
+    lines = text.splitlines()
+    for idx, line in enumerate(lines):
+        match = re.match(rf"^(\s*){escaped_parent}\s*:\s*$", line)
+        if not match:
+            continue
+        parent_indent = len(match.group(1))
+        block: List[str] = []
+        for child in lines[idx + 1:]:
+            if not child.strip() or child.lstrip().startswith("#"):
+                block.append(child)
+                continue
+            indent = len(child) - len(child.lstrip())
+            if indent <= parent_indent:
+                break
+            block.append(child[parent_indent + 1:] if len(child) > parent_indent else child)
+        block_text = "\n".join(block)
+        if _yamlish_has_list_item(block_text, key, item):
+            return True
+        if re.search(rf"(?m)^\s*{escaped_key}\s*:\s*\[[^\]]*\b{escaped_item}\b", block_text):
+            return True
+    return False
+
+
+def _build_fastpath_report(config_path: Optional[Path] = None) -> Dict[str, Any]:
+    """Inspect local plugin/Hermes hints that affect perceived WSP latency."""
+    config_path = config_path or _get_hermes_config_path()
+    plugin_yaml = Path(__file__).resolve().parent / "plugin.yaml"
+    setup_script = Path(__file__).resolve().parent / "setup.py"
+    checks: List[Dict[str, Any]] = []
+
+    plugin_text = ""
+    try:
+        plugin_text = plugin_yaml.read_text()
+    except OSError:
+        pass
+    checks.append({
+        "id": "plugin_tools_declared",
+        "ok": all(name in plugin_text for name in ["provides_tools", "web_search_plus", "web_extract_plus"]),
+        "detail": "plugin.yaml declares both WSP tools for direct Hermes registration",
+    })
+    checks.append({
+        "id": "standalone_setup_available",
+        "ok": setup_script.exists(),
+        "detail": "setup.py works without unreleased Hermes core plugin-CLI support",
+    })
+
+    config_text = ""
+    config_exists = config_path.exists()
+    if config_exists:
+        try:
+            config_text = config_path.read_text()
+        except OSError:
+            config_text = ""
+    legacy_web_disabled = _yamlish_nested_list_item(config_text, "agent", "disabled_toolsets", "web")
+
+    checks.extend([
+        {
+            "id": "hermes_config_found",
+            "ok": config_exists,
+            "detail": f"Hermes config inspected at {config_path}",
+        },
+        {
+            "id": "legacy_web_toolset_disabled",
+            "ok": legacy_web_disabled,
+            "detail": "agent.disabled_toolsets includes web, reducing legacy web-tool ambiguity on current Hermes builds",
+            "recommendation": "On current public Hermes builds, set agent.disabled_toolsets: [web] when you want Web Search Plus to be the preferred web path.",
+        },
+    ])
+    ok = all(check["ok"] for check in checks if check["id"] in {"plugin_tools_declared", "standalone_setup_available"})
+    preferred = ok and legacy_web_disabled
+    return {
+        "ok": ok,
+        "preferred_web_path_configured": preferred,
+        "hermes_config": str(config_path),
+        "checks": checks,
+        "recommended_hermes_config": {
+            "agent.disabled_toolsets": ["web"],
+        },
+        "notes": [
+            "Current public Hermes builds can register plugin tools directly, but may still route large tool catalogs through Tool Search when enabled.",
+            "Provider latency still depends on keys, cache, provider health, and whether the agent chooses normal search or research/extract mode.",
+            "No local Hermes core patches are required; this doctor only recommends config that exists in current Hermes.",
+        ],
+    }
+
+
+def _render_fastpath_report(report: Mapping[str, Any]) -> str:
+    lines = [
+        "Web Search Plus Fast-Path Doctor",
+        f"Status: {'preferred web path configured' if report.get('preferred_web_path_configured') else 'plugin ok; Hermes config can improve routing'}",
+        f"Hermes config: {report.get('hermes_config')}",
+        "",
+        "Checks:",
+    ]
+    for check in report.get("checks", []):
+        marker = "✓" if check.get("ok") else "•"
+        lines.append(f"  {marker} {check.get('id')}: {check.get('detail')}")
+        if not check.get("ok") and check.get("recommendation"):
+            lines.append(f"    Tip: {check.get('recommendation')}")
+    lines.extend([
+        "",
+        "Recommended Hermes config for current public Hermes builds:",
+        "  agent:",
+        "    disabled_toolsets: [web]",
+        "",
+        "Note: this plugin does not require local Hermes core patches. If your Hermes build",
+        "supports additional tool-pinning options, those may further reduce routing latency,",
+        "but they are not required for this doctor or the plugin to work.",
+    ])
+    return "\n".join(lines)
+
+
+def _keyless_public_opted_in(provider: str, config_path: Optional[Path] = None) -> bool:
+    """Registration-path mirror of config.keyless_public_allowed (env var or config.json, default off)."""
+    if is_truthy(os.environ.get(keyless_public_env_var(provider))):
+        return True
+    try:
+        config_path = config_path or _get_plugin_config_path()
+        if config_path.exists():
+            with open(config_path) as f:
+                section = json.load(f).get(PROVIDER_SPECS[provider].config_section, {})
+            return isinstance(section, dict) and is_truthy(section.get("allow_public"))
+    except (json.JSONDecodeError, OSError, TypeError, ValueError):
+        pass
+    return False
+
+
 def _default_behavior_config() -> Dict[str, Any]:
     return {
         "version": 1,
+        "profile": "standard",
         "default_provider": None,
         "auto_routing": {
             "enabled": True,
-            "fallback_provider": "serper",
+            "fallback_provider": "anysearch",
             "provider_priority": list(_DEFAULT_PROVIDER_PRIORITY),
+            "extract_provider_priority": list(_DEFAULT_EXTRACT_PROVIDER_PRIORITY),
             "disabled_providers": [],
             "auto_allow": dict(_DEFAULT_AUTO_ALLOW),
             "confidence_threshold": 0.3,
@@ -210,6 +419,26 @@ def _normalize_provider_csv(value: str, *, routing: bool = True) -> List[str]:
     return providers
 
 
+def _normalize_extract_provider_csv(value: str) -> List[str]:
+    providers: List[str] = []
+    seen = set()
+    extract_providers = set(_DEFAULT_EXTRACT_PROVIDER_PRIORITY)
+    for raw in (value or "").split(","):
+        if not raw.strip():
+            continue
+        provider = _normalize_routing_provider(raw)
+        if provider not in extract_providers:
+            raise SystemExit(f"Provider does not support extraction: {provider}")
+        if provider in seen:
+            print(f"warning: duplicate extract provider ignored: {provider}", file=sys.stderr)
+            continue
+        seen.add(provider)
+        providers.append(provider)
+    if not providers:
+        raise SystemExit("At least one extract provider is required.")
+    return providers
+
+
 def _append_missing_default_providers(providers: List[str]) -> List[str]:
     seen = set(providers)
     merged = list(providers)
@@ -220,11 +449,27 @@ def _append_missing_default_providers(providers: List[str]) -> List[str]:
     return merged
 
 
+def _append_missing_extract_providers(providers: List[str]) -> List[str]:
+    seen = set(providers)
+    return list(providers) + [provider for provider in _DEFAULT_EXTRACT_PROVIDER_PRIORITY if provider not in seen]
+
+
 def _merge_behavior_config(user_config: Mapping[str, Any]) -> Dict[str, Any]:
     config = _default_behavior_config()
     if not isinstance(user_config, Mapping):
         return config
     config["version"] = int(user_config.get("version", 1) or 1)
+    profile = user_config.get("profile", "standard")
+    if profile not in {"standard", "self_hosted"}:
+        raise SystemExit("profile must be standard or self_hosted")
+    config["profile"] = profile
+    # Status needs the self-hosted prerequisites without loading the full
+    # runtime config (and therefore without DNS validation). Keep these
+    # provider sections intact while routing preferences are merged below.
+    for section in ("searxng", "keenable"):
+        value = user_config.get(section)
+        if isinstance(value, Mapping):
+            config[section] = dict(value)
     default_provider = user_config.get("default_provider")
     if default_provider:
         config["default_provider"] = _normalize_routing_provider(str(default_provider))
@@ -240,6 +485,12 @@ def _merge_behavior_config(user_config: Mapping[str, Any]) -> Dict[str, Any]:
         else:
             priority = _normalize_provider_csv(",".join(str(p) for p in auto_user["provider_priority"]), routing=True)
         auto["provider_priority"] = _append_missing_default_providers(priority) if auto.get("enabled", True) is not False else priority
+    if auto_user.get("extract_provider_priority"):
+        if isinstance(auto_user["extract_provider_priority"], str):
+            extract_priority = _normalize_extract_provider_csv(auto_user["extract_provider_priority"])
+        else:
+            extract_priority = _normalize_extract_provider_csv(",".join(str(p) for p in auto_user["extract_provider_priority"]))
+        auto["extract_provider_priority"] = _append_missing_extract_providers(extract_priority)
     if "disabled_providers" in auto_user:
         disabled = auto_user.get("disabled_providers") or []
         if isinstance(disabled, str):
@@ -262,7 +513,7 @@ def _merge_behavior_config(user_config: Mapping[str, Any]) -> Dict[str, Any]:
     config["auto_routing"] = auto
     if config["default_provider"] and config["default_provider"] in set(auto.get("disabled_providers", [])):
         raise SystemExit("default_provider cannot be disabled")
-    return config
+    return apply_profile_effects(config)
 
 
 def _unique_timestamped_path(path: Path, marker: str) -> Path:
@@ -316,7 +567,35 @@ def _atomic_write_json(path: Path, data: Mapping[str, Any]) -> None:
 
 
 def _write_behavior_config(path: Path, data: Mapping[str, Any], *, dry_run: bool = False, backup: bool = False) -> None:
-    rendered = json.dumps(data, indent=2, sort_keys=True) + "\n"
+    merged: Dict[str, Any] = {}
+    if path.exists():
+        try:
+            existing = json.loads(path.read_text() or "{}")
+            if isinstance(existing, Mapping):
+                merged = dict(existing)
+        except (json.JSONDecodeError, OSError):
+            merged = {}
+    for key, value in data.items():
+        if isinstance(value, Mapping) and isinstance(merged.get(key), Mapping):
+            merged[key] = {**merged[key], **value}
+        else:
+            merged[key] = value
+    if merged.get("profile") == "self_hosted":
+        # These values are profile-owned runtime derivations, not independent
+        # persisted preferences. Removing an older standard-profile copy keeps
+        # the durable config to one switch plus provider prerequisites.
+        auto = merged.get("auto_routing")
+        if isinstance(auto, Mapping):
+            auto = dict(auto)
+            for field in (
+                "provider_priority",
+                "fallback_provider",
+                "extract_provider_priority",
+                "auto_allow",
+            ):
+                auto.pop(field, None)
+            merged["auto_routing"] = auto
+    rendered = json.dumps(merged, indent=2, sort_keys=True) + "\n"
     if dry_run:
         print(rendered, end="")
         return
@@ -324,28 +603,107 @@ def _write_behavior_config(path: Path, data: Mapping[str, Any], *, dry_run: bool
         backup_path = _unique_timestamped_path(path, "bak")
         shutil.copy2(path, backup_path)
         print(f"Backup written: {backup_path}")
-    _atomic_write_json(path, data)
+    _atomic_write_json(path, merged)
 
 
 def _routing_summary(config: Mapping[str, Any]) -> str:
     auto = config.get("auto_routing", {}) if isinstance(config.get("auto_routing"), Mapping) else {}
     lines = [
         "Routing:",
+        f"  profile: {config.get('profile', 'standard')}",
         f"  auto-routing: {'on' if auto.get('enabled', True) else 'off'}",
         f"  default provider: {config.get('default_provider') or 'none'}",
         f"  fallback provider: {auto.get('fallback_provider', 'serper')}",
-        "  priority: " + ", ".join(auto.get("provider_priority", _DEFAULT_PROVIDER_PRIORITY)),
+        "  search priority: " + ", ".join(auto.get("provider_priority", _DEFAULT_PROVIDER_PRIORITY)),
+        "  extract priority: " + ", ".join(auto.get("extract_provider_priority", _DEFAULT_EXTRACT_PROVIDER_PRIORITY)),
         "  disabled: " + (", ".join(auto.get("disabled_providers", [])) or "none"),
         "  auto-allow false: " + (
             ", ".join(p for p, allowed in sorted((auto.get("auto_allow") or {}).items()) if allowed is False) or "none"
         ),
         f"  confidence threshold: {auto.get('confidence_threshold', 0.3)}",
     ]
+    effective_pool = [
+        provider
+        for provider in auto.get("provider_priority", _DEFAULT_PROVIDER_PRIORITY)
+        if (auto.get("auto_allow") or {}).get(provider, True)
+    ]
+    lines.insert(2, "  effective auto pool: " + (", ".join(effective_pool) or "none"))
     return "\n".join(lines)
 
 
+def _is_well_formed_http_url(value: Any) -> bool:
+    """Validate the shape of an operator URL without DNS or provider traffic."""
+    if not isinstance(value, str) or not value.strip():
+        return False
+    parsed = urlparse(value.strip())
+    return parsed.scheme in {"http", "https"} and bool(parsed.hostname)
+
+
+def _profile_status(config: Mapping[str, Any], env: Mapping[str, str]) -> Dict[str, Any]:
+    """Report self-hosted prerequisites locally; status must stay network-free."""
+    profile = config.get("profile", "standard")
+    auto = config.get("auto_routing", {}) if isinstance(config.get("auto_routing"), Mapping) else {}
+    effective_pool = [
+        provider
+        for provider in auto.get("provider_priority", _DEFAULT_PROVIDER_PRIORITY)
+        if (auto.get("auto_allow") or {}).get(provider, True)
+    ]
+    searxng = config.get("searxng", {}) if isinstance(config.get("searxng"), Mapping) else {}
+    searxng_url = (
+        searxng.get("base_url")
+        or searxng.get("instance_url")
+        or env.get("SEARXNG_INSTANCE_URL")
+    )
+    keenable = config.get("keenable", {}) if isinstance(config.get("keenable"), Mapping) else {}
+    keenable_ready = bool(
+        _clean_env_value(env.get("KEENABLE_API_KEY") or "")
+        or _clean_env_value(str(keenable.get("api_key") or keenable.get("apiKey") or ""))
+        or is_truthy(keenable.get("allow_public"))
+        or is_truthy(env.get(keyless_public_env_var("keenable")))
+    )
+    searxng_ready = _is_well_formed_http_url(searxng_url)
+    checks = []
+    if profile == "self_hosted":
+        checks = [
+            {
+                "id": "searxng_base_url",
+                "ok": searxng_ready,
+                "detail": "searxng.base_url (or legacy instance_url) is present and well formed",
+            },
+            {
+                "id": "keenable_keyless",
+                "ok": keenable_ready,
+                "detail": "Keenable has an API key or its keyless public endpoint is enabled",
+            },
+        ]
+    return {
+        "active": profile,
+        "effective_auto_pool": effective_pool,
+        "ready": profile != "self_hosted" or searxng_ready or keenable_ready,
+        "checks": checks,
+    }
+
+
 def _status_payload(env: Optional[Mapping[str, str]] = None, config: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
-    return {"providers": _provider_config_status(env), "routing": dict(config or _default_behavior_config())}
+    active_env = env if env is not None else os.environ
+    active_config = dict(config or _default_behavior_config())
+    return {
+        "providers": _provider_config_status(active_env),
+        "profile": _profile_status(active_config, active_env),
+        "routing": active_config,
+    }
+
+
+def _render_profile_checks(profile: Mapping[str, Any]) -> str:
+    """Render offline self-hosted prerequisites for the human status command."""
+    lines = [
+        "Profile diagnostics (offline):",
+        f"  active: {profile.get('active', 'standard')}",
+        "  effective auto pool: " + ", ".join(profile.get("effective_auto_pool", [])),
+    ]
+    for check in profile.get("checks", []):
+        lines.append(f"  {'ok' if check.get('ok') else 'needs setup'}: {check.get('detail')}")
+    return "\n".join(lines)
 
 def _setup_state_path() -> Path:
     return Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes")) / "state" / "web-search-plus-onboarding.json"
@@ -471,7 +829,7 @@ def _render_provider_catalog(*, json_output: bool = False, color: Optional[bool]
 
 def _providers_for_preset(preset: str) -> List[Dict[str, Any]]:
     """Return provider catalog entries for a named setup preset."""
-    preset = preset.lower().strip()
+    preset = preset.lower().strip().replace("_", "-")
     if preset == "starter":
         names = {"you", "serper", "linkup"}
     elif preset == "lean":
@@ -480,17 +838,19 @@ def _providers_for_preset(preset: str) -> List[Dict[str, Any]]:
         names = {"you", "serper", "exa", "firecrawl", "tavily", "linkup"}
     elif preset == "extract":
         names = {"linkup", "firecrawl", "tavily"}
+    elif preset == "self-hosted":
+        names = {"searxng", "keenable"}
     elif preset == "all":
         names = {item["provider"] for item in _PROVIDER_CATALOG}
     else:
-        raise SystemExit(f"Unknown preset: {preset}. Choose starter, lean, search, extract, or all.")
+        raise SystemExit(f"Unknown preset: {preset}. Choose starter, lean, search, extract, self-hosted, or all.")
     return [item for item in _PROVIDER_CATALOG if item["provider"] in names]
 
 
 def _upsert_env_values(env_path: Path, values: Mapping[str, str]) -> Dict[str, List[str]]:
     """Insert/update env values in a .env file. Caller owns secret prompting."""
     env_path.parent.mkdir(parents=True, exist_ok=True)
-    existing_lines = env_path.read_text().splitlines() if env_path.exists() else []
+    existing_lines = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
     keys = set(values)
     seen = set()
     added: List[str] = []
@@ -515,7 +875,14 @@ def _upsert_env_values(env_path: Path, values: Mapping[str, str]) -> Dict[str, L
             output.append(f"{key}={value}")
             added.append(key)
 
-    env_path.write_text("\n".join(output).rstrip() + "\n")
+    # The .env holds plaintext API keys: create it 0600 and re-tighten an
+    # existing file before writing so other local users cannot read secrets.
+    env_path.touch(mode=0o600, exist_ok=True)
+    try:
+        os.chmod(env_path, 0o600)
+    except OSError:
+        pass
+    env_path.write_text("\n".join(output).rstrip() + "\n", encoding="utf-8")
     return {"updated": updated, "added": added}
 
 
@@ -546,7 +913,8 @@ def _web_search_plus_cli_setup(parser: argparse.ArgumentParser) -> None:
     parser.description = "Configure web-search-plus provider keys with a tiny, secret-safe wizard."
     parser.epilog = (
         "Default setup prompts every provider. Presets: starter=You+Serper+Linkup, lean=You+Linkup, "
-        "search=You+Serper+Exa+Firecrawl+Tavily+Linkup, extract=Linkup+Firecrawl+Tavily."
+        "search=You+Serper+Exa+Firecrawl+Tavily+Linkup, extract=Linkup+Firecrawl+Tavily, "
+        "self-hosted=SearXNG+keyless Keenable."
     )
     subs = parser.add_subparsers(dest="web_search_plus_command")
     status = subs.add_parser("status", help="Show a setup dashboard without printing secrets")
@@ -557,11 +925,12 @@ def _web_search_plus_cli_setup(parser: argparse.ArgumentParser) -> None:
 
     setup = subs.add_parser("setup", help="Run the provider-key setup wizard")
     setup.add_argument("providers", nargs="*", help="Provider names to configure (overrides --preset)")
-    setup.add_argument("--preset", default="all", help="starter, lean, search, extract, or all (default: all)")
+    setup.add_argument("--preset", default="all", help="starter, lean, search, extract, self-hosted, or all (default: all)")
     setup.add_argument("--open", action="store_true", help="Open signup URLs in a browser before prompting")
     setup.add_argument("--env-path", help="Override Hermes .env path")
     setup.add_argument("--config-path", help="Override web-search-plus config.json path")
     setup.add_argument("--show-values", action="store_true", help="Use visible input instead of hidden secret prompts")
+    setup.add_argument("--keyless-public", action="store_true", help="Opt into the keyless public tier (no API key) for any keyless provider, skipping its confirmation prompt")
     setup.add_argument("--dry-run", action="store_true", help="Show the setup/routing plan without writing files")
     setup.add_argument("--routing", choices=["auto", "fixed"], help="Persist routing mode after key setup")
     setup.add_argument("--default-provider", help="Provider to use when routing is fixed/off")
@@ -574,6 +943,16 @@ def _web_search_plus_cli_setup(parser: argparse.ArgumentParser) -> None:
 
     list_cmd = subs.add_parser("list", help="List supported providers, capabilities, and signup URLs")
     list_cmd.add_argument("--json", action="store_true", help="Print provider catalog as JSON")
+
+    fastpath = subs.add_parser("fastpath", help="Inspect WSP setup and Hermes config hints for low-latency tool routing")
+    fastpath.add_argument("--json", action="store_true", help="Print fast-path report as JSON")
+    fastpath.add_argument("--config-path", help="Hermes config.yaml path to inspect")
+
+    bench_cmd = subs.add_parser(
+        "bench",
+        help="Benchmark configured search providers with a fixed live query suite and recommend an auto-routing priority (spends real provider quota)",
+    )
+    bench_cmd.add_argument("--json", action="store_true", help="Print the bench report as JSON")
 
     config_cmd = subs.add_parser("config", help="Inspect or change routing preferences")
     config_subs = config_cmd.add_subparsers(dest="config_command")
@@ -592,10 +971,14 @@ def _web_search_plus_cli_setup(parser: argparse.ArgumentParser) -> None:
     set_fallback.add_argument("provider")
     set_fallback.add_argument("--config-path")
     set_fallback.add_argument("--dry-run", action="store_true")
-    set_priority = config_subs.add_parser("set-priority", help="Set comma-separated auto-routing priority")
+    set_priority = config_subs.add_parser("set-priority", help="Set comma-separated search auto-routing priority")
     set_priority.add_argument("providers")
     set_priority.add_argument("--config-path")
     set_priority.add_argument("--dry-run", action="store_true")
+    set_extract_priority = config_subs.add_parser("set-extract-priority", help="Set comma-separated extraction auto-routing priority")
+    set_extract_priority.add_argument("providers")
+    set_extract_priority.add_argument("--config-path")
+    set_extract_priority.add_argument("--dry-run", action="store_true")
     disable = config_subs.add_parser("disable", help="Disable a provider for auto-routing")
     disable.add_argument("provider")
     disable.add_argument("--config-path")
@@ -648,7 +1031,15 @@ def _apply_setup_routing_args(config: Dict[str, Any], args: Any) -> Dict[str, An
             raise SystemExit("confidence threshold must be between 0.0 and 1.0")
         auto["confidence_threshold"] = value
     updated["auto_routing"] = auto
-    return _merge_behavior_config(updated)
+    preset = str(getattr(args, "preset", "") or "").lower().strip().replace("_", "-")
+    if preset == "self-hosted":
+        updated["profile"] = "self_hosted"
+    merged = _merge_behavior_config(updated)
+    if preset == "self-hosted":
+        # Selecting the privacy/budget preset is explicit consent to the
+        # existing keyless public Keenable path; no API key is written.
+        merged.setdefault("keenable", {})["allow_public"] = True
+    return merged
 
 
 def _handle_config_command(args: Any) -> None:
@@ -674,6 +1065,8 @@ def _handle_config_command(args: Any) -> None:
         config["auto_routing"]["fallback_provider"] = _normalize_routing_provider(getattr(args, "provider"))
     elif subcommand == "set-priority":
         config["auto_routing"]["provider_priority"] = _normalize_provider_csv(getattr(args, "providers"), routing=True)
+    elif subcommand == "set-extract-priority":
+        config["auto_routing"]["extract_provider_priority"] = _normalize_extract_provider_csv(getattr(args, "providers"))
     elif subcommand == "disable":
         provider = _normalize_routing_provider(getattr(args, "provider"))
         disabled = list(config["auto_routing"].get("disabled_providers", []))
@@ -720,6 +1113,29 @@ def _web_search_plus_cli_command(args: Any) -> None:
         print(_render_provider_catalog(json_output=getattr(args, "json", False)))
         return
 
+    if command == "fastpath":
+        config_arg = getattr(args, "config_path", None)
+        report = _build_fastpath_report(Path(config_arg) if config_arg else None)
+        if getattr(args, "json", False):
+            print(json.dumps(report, indent=2, sort_keys=True))
+        else:
+            print(_render_fastpath_report(report))
+        return
+
+    if command == "bench":
+        search = _load_search_module()
+        if search is None:
+            raise SystemExit(
+                "web-search-plus: in-process search engine unavailable; "
+                "run `python3 search.py --bench` from the plugin directory instead."
+            )
+        report = search.run_provider_bench(search.load_config())
+        if getattr(args, "json", False):
+            print(json.dumps(report, indent=2, ensure_ascii=False))
+        else:
+            print(search.format_bench_text(report))
+        return
+
     if command == "config":
         _handle_config_command(args)
         return
@@ -734,11 +1150,14 @@ def _web_search_plus_cli_command(args: Any) -> None:
             for key, value in _read_env_file(_get_hermes_env_path()).items():
                 env.setdefault(key, value)
         config = _load_behavior_config(Path(config_path)) if config_path else _load_behavior_config()
+        payload = _status_payload(env, config)
         if getattr(args, "json", False):
-            print(json.dumps(_status_payload(env, config), indent=2, sort_keys=True))
+            print(json.dumps(payload, indent=2, sort_keys=True))
         else:
             print(_render_setup_guidance(env=env, fancy=not getattr(args, "plain", False)))
             print("\n" + _routing_summary(config))
+            if payload["profile"]["active"] == "self_hosted":
+                print("\n" + _render_profile_checks(payload["profile"]))
         return
 
     if command == "setup":
@@ -751,12 +1170,14 @@ def _web_search_plus_cli_command(args: Any) -> None:
         env_path = Path(getattr(args, "env_path", None) or _get_hermes_env_path())
         config_path = Path(getattr(args, "config_path", None) or _get_plugin_config_path())
         config = _apply_setup_routing_args(_load_behavior_config(config_path), args)
+        profile_preset = str(getattr(args, "preset", "") or "").lower().strip().replace("_", "-") == "self-hosted"
         print(_render_status_dashboard(_provider_config_status(_read_env_file(env_path))))
         print("\nSetup plan:")
         for item in catalog:
             rec = " recommended" if item.get("recommended") else ""
             caps = ", ".join(item.get("capabilities", []))
-            print(f"  • {item['display_name']} ({item['provider']}) — {item['env']} — {caps}{rec}")
+            keyless = " — keyless public tier available (no key needed)" if item["provider"] in _KEYLESS_PROVIDER_IDS else ""
+            print(f"  • {item['display_name']} ({item['provider']}) — {item['env']} — {caps}{rec}{keyless}")
             print(f"    {item['signup_url']}")
         print(f"\nTarget env file: {env_path}")
         print(f"Target config file: {config_path}")
@@ -765,7 +1186,9 @@ def _web_search_plus_cli_command(args: Any) -> None:
             print("Dry run only; no keys or routing config written.")
             return
 
+        force_keyless = getattr(args, "keyless_public", False) or profile_preset
         values: Dict[str, str] = {}
+        keyless_enable: List[str] = []
         for item in catalog:
             if getattr(args, "open", False):
                 webbrowser.open(item["signup_url"])
@@ -779,10 +1202,25 @@ def _web_search_plus_cli_command(args: Any) -> None:
                 value = ""
             if value:
                 values[item["env"]] = value
+                continue
+            if item["provider"] not in _KEYLESS_PROVIDER_IDS or _keyless_public_opted_in(item["provider"], config_path):
+                continue
+            if force_keyless:
+                answer = "y"
+            else:
+                try:
+                    answer = input(f"  Use {item['display_name']} keyless public search (no API key)? [y/N, Enter to skip]: ").strip().lower()
+                except (EOFError, OSError):
+                    answer = ""
+            if answer in ("y", "yes"):
+                keyless_enable.append(item["provider"])
+        for provider in keyless_enable:
+            config.setdefault(PROVIDER_SPECS[provider].config_section, {})["allow_public"] = True
         routing_args_present = any(
             getattr(args, name, None) is not None
             for name in ["routing", "default_provider", "provider_priority", "disable_providers", "fallback_provider", "confidence_threshold"]
         )
+        routing_args_present = routing_args_present or profile_preset
         wrote_any = False
         if values:
             result = _upsert_env_values(env_path, values)
@@ -790,9 +1228,13 @@ def _web_search_plus_cli_command(args: Any) -> None:
             print(f"\n✓ Configured {len(changed)} provider key(s) in {env_path}: " + ", ".join(changed))
             print("✓ Secrets were not printed.")
             wrote_any = True
-        if routing_args_present:
+        if routing_args_present or keyless_enable:
             _write_behavior_config(config_path, config)
-            print(f"✓ Saved routing preferences in {config_path}")
+            if routing_args_present:
+                print(f"✓ Saved routing preferences in {config_path}")
+            if keyless_enable:
+                names = ", ".join(PROVIDER_SPECS[p].display_name for p in keyless_enable)
+                print(f"✓ Enabled keyless public search for {names} in {config_path}")
             wrote_any = True
         if not wrote_any:
             print("No keys entered; nothing changed.")
@@ -838,11 +1280,40 @@ def _load_search_module() -> Any:
             return _search_module
         if _search_import_failed:
             return None
-        plugin_dir = str(Path(__file__).parent)
-        inserted = False
-        if plugin_dir not in sys.path:
-            sys.path.insert(0, plugin_dir)
-            inserted = True
+        plugin_dir = str(_PLUGIN_DIR)
+        original_sys_path = list(sys.path)
+        # Hermes may already have this plugin path on sys.path, but behind the
+        # host package root. Move it to the front while flat sibling imports
+        # resolve, then restore the exact original order in the finally block.
+        sys.path[:] = [entry for entry in sys.path if entry != plugin_dir]
+        sys.path.insert(0, plugin_dir)
+        # Stash any top-level modules whose names collide with this plugin's
+        # flat sibling imports (providers, extract, routing, research, etc.).
+        # If hermes-agent's `providers` package is already in sys.modules,
+        # `from providers import extract_exa` inside extract.py resolves
+        # to the wrong module. Pop them for the duration of the load,
+        # restore afterward.
+        _COLLIDING_MODULES = (
+            "providers",
+            "bench",
+            "extract",
+            "routing",
+            "research",
+            "search",
+            "config",
+            "cache",
+            "quality",
+            "http_client",
+            "env_loader",
+            "provider_health",
+            "provider_dispatch",
+            "provider_registry",
+            "search_locale",
+        )
+        stashed: dict[str, Any] = {}
+        for _name in _COLLIDING_MODULES:
+            if _name in sys.modules:
+                stashed[_name] = sys.modules.pop(_name)
         try:
             spec = importlib.util.spec_from_file_location("_wsp_search_engine", _SEARCH_SCRIPT)
             if spec is None or spec.loader is None:
@@ -856,11 +1327,13 @@ def _load_search_module() -> Any:
             _search_import_failed = True
             return None
         finally:
-            if inserted:
-                try:
-                    sys.path.remove(plugin_dir)
-                except ValueError:  # pragma: no cover - defensive cleanup
-                    pass
+            # Restore the original top-level modules so unrelated code that
+            # imported `providers` etc. still sees what it expects.
+            for _name in _COLLIDING_MODULES:
+                sys.modules.pop(_name, None)
+            for _name, _mod in stashed.items():
+                sys.modules[_name] = _mod
+            sys.path[:] = original_sys_path
         _search_module = _search
         return _search_module
 
@@ -895,6 +1368,8 @@ def _run_search(
     count: int = 5,
     exa_depth: str = "normal",
     time_range: Optional[str] = None,
+    freshness: Optional[str] = None,
+    search_type: Optional[str] = None,
     include_domains: Optional[List[str]] = None,
     exclude_domains: Optional[List[str]] = None,
     mode: str = "normal",
@@ -915,7 +1390,8 @@ def _run_search(
     if search is None:
         return _run_search_subprocess(
             query=query, provider=provider, count=count, exa_depth=exa_depth,
-            time_range=time_range, include_domains=include_domains,
+            time_range=time_range, freshness=freshness, search_type=search_type,
+            include_domains=include_domains,
             exclude_domains=exclude_domains, mode=mode, quality_report=quality_report,
             research_time_budget=research_time_budget, language=language, country=country,
             subprocess_timeout=timeout,
@@ -924,7 +1400,8 @@ def _run_search(
     def call() -> dict:
         return search.run_search_request(
             query=query, provider=provider, count=count, exa_depth=exa_depth,
-            time_range=time_range, include_domains=include_domains,
+            time_range=time_range, freshness=freshness, search_type=search_type,
+            include_domains=include_domains,
             exclude_domains=exclude_domains, mode=mode, quality_report=quality_report,
             research_time_budget=research_time_budget, language=language, country=country,
         )
@@ -943,6 +1420,8 @@ def _run_search_subprocess(
     count: int = 5,
     exa_depth: str = "normal",
     time_range: Optional[str] = None,
+    freshness: Optional[str] = None,
+    search_type: Optional[str] = None,
     include_domains: Optional[List[str]] = None,
     exclude_domains: Optional[List[str]] = None,
     mode: str = "normal",
@@ -965,6 +1444,10 @@ def _run_search_subprocess(
         cmd += ["--exa-depth", exa_depth]
     if time_range and time_range != "none":
         cmd += ["--time-range", time_range]
+    if freshness:
+        cmd += ["--freshness", str(freshness)]
+    if search_type:
+        cmd += ["--search-type", str(search_type)]
     if include_domains:
         cmd += ["--include-domains"] + include_domains
     if exclude_domains:
@@ -1012,6 +1495,8 @@ def _run_extract(
     include_images: bool = False,
     include_raw_html: bool = False,
     render_js: bool = False,
+    spans: bool = False,
+    spans_query: Optional[str] = None,
     subprocess_timeout: int = 90,
 ) -> dict:
     """Run URL extraction in-process (fast path), falling back to the subprocess."""
@@ -1020,14 +1505,15 @@ def _run_extract(
         return _run_extract_subprocess(
             urls, provider=provider, output_format=output_format,
             include_images=include_images, include_raw_html=include_raw_html,
-            render_js=render_js, subprocess_timeout=subprocess_timeout,
+            render_js=render_js, spans=spans, spans_query=spans_query,
+            subprocess_timeout=subprocess_timeout,
         )
 
     def call() -> dict:
         return search.run_extract_request(
             urls, provider=provider, output_format=output_format,
             include_images=include_images, include_raw_html=include_raw_html,
-            render_js=render_js,
+            render_js=render_js, spans=spans, spans_query=spans_query,
         )
 
     try:
@@ -1045,6 +1531,8 @@ def _run_extract_subprocess(
     include_images: bool = False,
     include_raw_html: bool = False,
     render_js: bool = False,
+    spans: bool = False,
+    spans_query: Optional[str] = None,
     subprocess_timeout: int = 90,
 ) -> dict:
     """Legacy fallback: call search.py extract mode and return parsed JSON result."""
@@ -1065,6 +1553,10 @@ def _run_extract_subprocess(
         cmd.append("--include-raw-html")
     if render_js:
         cmd.append("--render-js")
+    if spans:
+        cmd.append("--spans")
+    if spans_query is not None:
+        cmd.extend(["--spans-query", spans_query])
 
     env = os.environ.copy()
     try:
@@ -1090,7 +1582,6 @@ def _format_results(data: dict) -> str:
     results = data.get("results", [])
     provider = data.get("provider", "unknown")
     routing = data.get("routing", {})
-    answer = data.get("answer", "")
     cached = data.get("cached", False)
 
     lines = []
@@ -1102,8 +1593,35 @@ def _format_results(data: dict) -> str:
     else:
         lines.append(f"[Provider: {provider}{' | cached' if cached else ''}]")
 
-    if answer:
-        lines.append(f"\nAnswer: {answer}\n")
+    freshness_meta = (data.get("metadata") or {}).get("freshness")
+    if isinstance(freshness_meta, dict) and freshness_meta.get("requested"):
+        per_provider = freshness_meta.get("providers")
+        if isinstance(per_provider, list):
+            applied = [m.get("provider") for m in per_provider if m.get("applied")]
+            skipped = [m.get("provider") for m in per_provider if not m.get("applied")]
+            detail = "applied by: " + (", ".join(str(p) for p in applied) or "none")
+            if skipped:
+                detail += " | not supported: " + ", ".join(str(p) for p in skipped)
+        elif freshness_meta.get("applied"):
+            detail = "applied"
+        else:
+            detail = f"not applied — {freshness_meta.get('reason', 'unsupported provider')}"
+        lines.append(f"[Freshness: {freshness_meta['requested']} | {detail}]")
+
+    search_type_meta = (data.get("metadata") or {}).get("search_type")
+    if isinstance(search_type_meta, dict) and search_type_meta.get("requested"):
+        per_provider = search_type_meta.get("providers")
+        if isinstance(per_provider, list):
+            applied = [m.get("provider") for m in per_provider if m.get("applied")]
+            skipped = [m.get("provider") for m in per_provider if not m.get("applied")]
+            detail = "applied by: " + (", ".join(str(p) for p in applied) or "none")
+            if skipped:
+                detail += " | not supported: " + ", ".join(str(p) for p in skipped)
+        elif search_type_meta.get("applied"):
+            detail = "applied"
+        else:
+            detail = f"not applied — {search_type_meta.get('reason', 'unsupported provider')}"
+        lines.append(f"[Search type: {search_type_meta['requested']} | {detail}]")
 
     quality_report = data.get("quality_report") or {}
     if quality_report:
@@ -1143,12 +1661,89 @@ def _format_results(data: dict) -> str:
     return "\n".join(lines).strip()
 
 
+
+
+_BASE64_MARKDOWN_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\(\s*data:image/[^)]+\)", re.IGNORECASE)
+_BASE64_HTML_IMAGE_RE = re.compile(r"<img\b(?=[^>]*\bsrc=[\"']data:image/)[^>]*(?:\balt=[\"']([^\"']*)[\"'])?[^>]*>", re.IGNORECASE)
+_DEFAULT_EXTRACT_CHAR_LIMIT = 15000
+
+
+def _sanitize_extract_content(content: str) -> str:
+    """Remove inline base64 image bombs while preserving normal http(s) images."""
+    def markdown_repl(match: re.Match[str]) -> str:
+        alt = (match.group(1) or "image").strip() or "image"
+        return f"[IMAGE: {alt}]"
+
+    def html_repl(match: re.Match[str]) -> str:
+        tag = match.group(0)
+        alt_match = re.search(r"\balt=[\"']([^\"']*)[\"']", tag, re.IGNORECASE)
+        alt = (alt_match.group(1) if alt_match else "image").strip() or "image"
+        return f"[IMAGE: {alt}]"
+
+    content = _BASE64_MARKDOWN_IMAGE_RE.sub(markdown_repl, content)
+    content = _BASE64_HTML_IMAGE_RE.sub(html_repl, content)
+    return content
+
+
+def _extract_char_limit() -> int:
+    """Read web.extract_char_limit with a safe default for old configs."""
+    try:
+        config = load_config()
+        limit = int(((config.get("web") or {}).get("extract_char_limit")) or _DEFAULT_EXTRACT_CHAR_LIMIT)
+    except Exception:
+        return _DEFAULT_EXTRACT_CHAR_LIMIT
+    return max(1000, limit)
+
+
+def _split_extract_content(content: str, limit: int) -> tuple[str, str, int, int]:
+    """Return head, tail, omitted-start line, and omitted char count."""
+    head_chars = min(max(1, int(limit * 2 / 3)), max(1, limit - 1))
+    tail_chars = min(max(1, int(limit * 0.2)), max(1, limit - head_chars))
+    if head_chars + tail_chars >= len(content):
+        return content, "", content.count("\n") + 1, 0
+    head = content[:head_chars].rstrip()
+    tail = content[-tail_chars:].lstrip()
+    omitted_start_line = head.count("\n") + 1
+    omitted_chars = max(0, len(content) - len(head) - len(tail))
+    return head, tail, omitted_start_line, omitted_chars
+
+
+def _format_truncated_extract_content(content: str, url: str, limit: int) -> str:
+    """Return inline-safe extract content, storing full text when truncated."""
+    cleaned = _sanitize_extract_content(content)
+    if len(cleaned) <= limit:
+        return cleaned
+
+    store_meta = store_web_text(url or "unknown-url", cleaned, max_chars=MAX_STORED_TEXT_CHARS)
+    head, tail, omitted_start_line, omitted_chars = _split_extract_content(cleaned, limit)
+    footer = [
+        "",
+        "---",
+        f"[Content truncated: original {len(cleaned)} chars; omitted middle {omitted_chars} chars; showing head and tail.]",
+    ]
+    if store_meta.get("stored"):
+        footer.append(f"Full cleaned text stored at: {store_meta['path']}")
+        footer.append(
+            "Page omitted middle with Hermes file tool: "
+            f"read_file(path=\"{store_meta['path']}\", offset={omitted_start_line}, limit=500)"
+        )
+        footer.append("For more of the omitted middle, repeat read_file with the next offset; the stored path contains the cleaned text for page-on-demand.")
+        if store_meta.get("capped"):
+            footer.append(
+                f"Stored file capped at {MAX_STORED_TEXT_CHARS} characters; cleaned text was {store_meta.get('original_chars')} chars."
+            )
+    else:
+        footer.append(f"Full-text store failed for path: {store_meta.get('path')} ({store_meta.get('error', 'unknown error')})")
+    return f"{head}\n\n[... omitted middle; see footer for page-on-demand ...]\n\n{tail}" + "\n" + "\n".join(footer)
+
+
 def _format_extract_results(data: dict) -> str:
     """Format extracted URL content for LLM consumption."""
     if "error" in data and not data.get("results"):
         return f"Extract error: {data['error']}"
     provider = data.get("provider", "unknown")
     lines = [f"[Provider: {provider}]"]
+    limit = _extract_char_limit()
     for i, r in enumerate(data.get("results", []), 1):
         title = r.get("title") or "No title"
         url = r.get("url", "")
@@ -1159,7 +1754,14 @@ def _format_extract_results(data: dict) -> str:
         if r.get("error"):
             lines.append(f"Error: {r['error']}")
         elif content:
-            lines.append(content)
+            lines.append(_format_truncated_extract_content(content, url, limit))
+        if "spans" in r:
+            lines.append(
+                "Semantic spans (contract v{}): {}".format(
+                    r.get("span_contract_version", 1),
+                    json.dumps(r["spans"], ensure_ascii=False, separators=(",", ":")),
+                )
+            )
     return "\n".join(lines).strip()
 
 
@@ -1176,9 +1778,9 @@ def register(ctx: Any) -> None:
             "Brave for general web search, "
             "Linkup for source-backed grounding/citations, "
             "Firecrawl for web search plus optional scrape-ready results, "
-            "Perplexity for direct answers, You.com for real-time snippets, "
-            "SearXNG for privacy-focused/self-hosted search, and SerpBase/Querit only when explicitly enabled or forced. "
-            "Set depth='deep' for Exa multi-source synthesis, 'deep-reasoning' for complex cross-document analysis. "
+            "You.com for real-time snippets, SearXNG for privacy-focused/self-hosted search, "
+            "and SerpBase/Querit only when explicitly enabled or forced. "
+            "All providers are constrained to source-result/source-text modes. "
             "Override with provider param if needed."
         ),
         "parameters": {
@@ -1190,14 +1792,14 @@ def register(ctx: Any) -> None:
                 },
                 "provider": {
                     "type": "string",
-                    "enum": ["auto", "serper", "serpbase", "anysearch", "brave", "tavily", "exa", "querit", "linkup", "firecrawl", "parallel", "perplexity", "kilo-perplexity", "you", "searxng"],
+                    "enum": ["auto", *SEARCH_PROVIDER_IDS],
                     "description": "Search provider. Use 'auto' for intelligent routing (default). Brave and Serper share generic web-search intents and ties are distributed deterministically per query.",
                     "default": "auto",
                 },
                 "depth": {
                     "type": "string",
-                    "enum": ["normal", "deep", "deep-reasoning"],
-                    "description": "Exa search depth: 'deep' synthesizes across sources (4-12s), 'deep-reasoning' for complex cross-document analysis (12-50s). Only applies when routed to Exa.",
+                    "enum": ["normal"],
+                    "description": "Exa source-result depth; fixed to normal by the source-only charter.",
                     "default": "normal",
                 },
                 "count": {
@@ -1211,6 +1813,26 @@ def register(ctx: Any) -> None:
                     "type": "string",
                     "enum": ["day", "week", "month", "year"],
                     "description": "Filter results by recency. Optional.",
+                },
+                "freshness": {
+                    "type": "string",
+                    "enum": ["day", "week", "month", "year"],
+                    "description": (
+                        "Unified recency filter (case-insensitive). Applied natively by serper, brave, "
+                        "querit, firecrawl, keenable, you, and searxng; "
+                        "providers without recency support (tavily, exa, linkup, parallel, serpbase) still "
+                        "run the search and report freshness.applied=false in result metadata. Optional."
+                    ),
+                },
+                "search_type": {
+                    "type": "string",
+                    "enum": ["search", "news"],
+                    "description": (
+                        "Result vertical: 'search' (default) or 'news'. Served natively by serper "
+                        "(google.serper.dev/news); other providers run the normal search and report "
+                        "search_type.applied=false in result metadata. Optional."
+                    ),
+                    "default": "search",
                 },
                 "include_domains": {
                     "type": "array",
@@ -1240,15 +1862,26 @@ def register(ctx: Any) -> None:
                     "minimum": 1,
                     "maximum": 75,
                 },
+                "country": {
+                    "type": "string",
+                    "description": "ISO 3166-1 alpha-2 country override for providers with region parameters (e.g. 'at', 'fr'). Beats configured locale defaults and query location hints. Optional.",
+                },
+                "language": {
+                    "type": "string",
+                    "description": "ISO 639-1 language override for providers with language parameters (e.g. 'de'). Beats configured locale defaults and 'auto' query language inference. Optional.",
+                },
             },
             "required": ["query"],
         },
     }
 
     def handler(args_or_query, provider: str = "auto", count: int = 5, depth: str = "normal",
-                time_range: Optional[str] = None, include_domains: Optional[List[str]] = None,
+                time_range: Optional[str] = None, freshness: Optional[str] = None,
+                search_type: Optional[str] = None,
+                include_domains: Optional[List[str]] = None,
                 exclude_domains: Optional[List[str]] = None, mode: str = "normal",
-                quality_report: bool = False, research_time_budget: float = 55.0, **kwargs) -> str:
+                quality_report: bool = False, research_time_budget: float = 55.0,
+                country: Optional[str] = None, language: Optional[str] = None, **kwargs) -> str:
         # Hermes registry passes the entire input dict as first positional arg
         if isinstance(args_or_query, dict):
             query = args_or_query.get("query", "")
@@ -1256,11 +1889,15 @@ def register(ctx: Any) -> None:
             count = args_or_query.get("count", count)
             depth = args_or_query.get("depth", depth)
             time_range = args_or_query.get("time_range", time_range)
+            freshness = args_or_query.get("freshness", freshness)
+            search_type = args_or_query.get("search_type", search_type)
             include_domains = args_or_query.get("include_domains", include_domains)
             exclude_domains = args_or_query.get("exclude_domains", exclude_domains)
             mode = args_or_query.get("mode", mode)
             quality_report = args_or_query.get("quality_report", quality_report)
             research_time_budget = args_or_query.get("research_time_budget", research_time_budget)
+            country = args_or_query.get("country", country)
+            language = args_or_query.get("language", language)
         else:
             query = args_or_query
         data = _run_search(
@@ -1269,21 +1906,25 @@ def register(ctx: Any) -> None:
             count=count,
             exa_depth=depth,
             time_range=time_range,
+            freshness=freshness,
+            search_type=search_type,
             include_domains=include_domains,
             exclude_domains=exclude_domains,
             mode=mode,
             quality_report=quality_report,
             research_time_budget=research_time_budget,
+            language=language,
+            country=country,
         )
         return _format_results(data)
 
     def check_fn() -> bool:
-        """Search is available if at least one search provider credential is configured."""
-        return any(os.environ.get(k) for k in _PROVIDER_ENV_KEYS)
+        return any(os.environ.get(k) for k in _PROVIDER_ENV_KEYS) or any(
+            _keyless_public_opted_in(p) for p in _KEYLESS_PROVIDER_IDS)
 
     def extract_check_fn() -> bool:
-        """Extraction is available if at least one extraction-capable provider credential is configured."""
-        return any(os.environ.get(k) for k in _EXTRACT_PROVIDER_ENV_KEYS)
+        return any(os.environ.get(k) for k in _EXTRACT_PROVIDER_ENV_KEYS) or any(
+            _keyless_public_opted_in(p) for p in _KEYLESS_EXTRACT_PROVIDER_IDS)
 
     ctx.register_tool(
         name="web_search_plus",
@@ -1300,17 +1941,23 @@ def register(ctx: Any) -> None:
         "name": "web_extract_plus",
         "description": (
             "Multi-provider URL content extraction. Auto tries Tavily, Exa, Linkup, "
-            "Firecrawl, then You.com; force a provider for robust scraping, clean markdown, or explicit fallback tests."
+            "Firecrawl, You.com, Serper (plus keyless Keenable when its public endpoint is opted in); "
+            "force a provider for robust scraping, clean markdown, or explicit fallback tests."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "urls": {"type": "array", "items": {"type": "string"}, "description": "URLs to extract"},
-                "provider": {"type": "string", "enum": ["auto", "firecrawl", "linkup", "parallel", "tavily", "exa", "you", "anysearch"], "default": "auto"},
+                "provider": {"type": "string", "enum": ["auto", *EXTRACT_PROVIDER_IDS], "default": "auto"},
                 "format": {"type": "string", "enum": ["markdown", "html"], "default": "markdown"},
                 "include_images": {"type": "boolean", "default": False},
                 "include_raw_html": {"type": "boolean", "default": False},
                 "render_js": {"type": "boolean", "default": False},
+                "spans": {"type": "boolean", "default": False},
+                "spans_query": {
+                    "type": "string",
+                    "description": "Optional query for deterministic semantic span ranking",
+                },
             },
             "required": ["urls"],
         },
@@ -1318,7 +1965,8 @@ def register(ctx: Any) -> None:
 
     def extract_handler(args_or_urls, provider: str = "auto", format: str = "markdown",
                         include_images: bool = False, include_raw_html: bool = False,
-                        render_js: bool = False, **kwargs) -> str:
+                        render_js: bool = False, spans: bool = False,
+                        spans_query: Optional[str] = None, **kwargs) -> str:
         if isinstance(args_or_urls, dict):
             urls = args_or_urls.get("urls", [])
             provider = args_or_urls.get("provider", provider)
@@ -1326,6 +1974,10 @@ def register(ctx: Any) -> None:
             include_images = args_or_urls.get("include_images", include_images)
             include_raw_html = args_or_urls.get("include_raw_html", include_raw_html)
             render_js = args_or_urls.get("render_js", render_js)
+            spans = args_or_urls.get("spans", spans)
+            spans_query = args_or_urls.get(
+                "spans_query", args_or_urls.get("query", spans_query)
+            )
         else:
             urls = args_or_urls
         if isinstance(urls, str):
@@ -1337,6 +1989,8 @@ def register(ctx: Any) -> None:
             include_images=include_images,
             include_raw_html=include_raw_html,
             render_js=render_js,
+            spans=spans,
+            spans_query=spans_query,
         )
         return _format_extract_results(data)
 

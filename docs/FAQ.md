@@ -24,9 +24,29 @@ python ~/.hermes/plugins/web-search-plus/setup.py config set-auto-allow serpbase
 
 If Routing v2 is enabled, the query analyzer scores providers by query signals such as current-info intent, product/local intent, research language, direct-answer intent, semantic-discovery intent, privacy intent, language/script hints, and class-specific benchmark rules. The router then filters out unavailable, disabled, or `auto_allow=false` providers and chooses the best eligible provider. Ties are deterministic per query.
 
-The default auto-search pool is conservative: You.com, Serper, Exa, Firecrawl, Tavily, and Linkup. Brave, SerpBase, Querit, Parallel, native Perplexity, and Kilo Perplexity default to explicit/guarded use; Kilo Perplexity is intended for answer/research mode rather than fast search auto-routing.
+The default auto-search pool is conservative: You.com, Serper, Exa, Firecrawl, Tavily, Linkup, and Brave. SerpBase, Querit, and Parallel default to explicit/guarded use. Native Perplexity and Kilo Perplexity are not registered in 3.0 because their legacy answer endpoints do not provide a verified source-only mode.
 
 For the exact flow, see [Architecture](ARCHITECTURE.md#routing-engine).
+
+## Which search or extraction provider order should I use?
+
+Measure instead of guessing: run the built-in provider bench, which races your configured providers against a small fixed query suite and recommends an `auto_routing.provider_priority` order ranked by success rate, median latency, and simple quality signals:
+
+```bash
+python ~/.hermes/plugins/web-search-plus/setup.py bench
+# or, from the plugin directory:
+python3 search.py --bench
+```
+
+The bench never changes your config — it prints the recommended **search** priority plus the exact `config set-priority` command to apply it. Bench runs call providers directly, so they do not trigger cooldowns or feed adaptive routing statistics, but they do spend a few real API calls per provider.
+
+Extraction has a separate order because search quality and extraction quality are different jobs. Configure it independently:
+
+```bash
+python ~/.hermes/plugins/web-search-plus/setup.py config set-extract-priority serper,parallel,tavily,exa,linkup,firecrawl,you,keenable
+```
+
+This writes `auto_routing.extract_provider_priority`; it never changes search `provider_priority`. Omitted extract-capable providers are appended in registry order. See [User Guide → Bench your providers](USER_GUIDE.md#bench-your-providers).
 
 ## How do I force one provider?
 
@@ -109,18 +129,18 @@ python ~/.hermes/plugins/web-search-plus/setup.py setup you
 python ~/.hermes/plugins/web-search-plus/setup.py config set-default you
 ```
 
-Extraction requires an extraction-capable provider such as Linkup, Firecrawl, Tavily, Exa, Parallel, or You.com.
+Extraction requires an extraction-capable provider such as Linkup, Firecrawl, Tavily, Exa, Parallel, You.com, or the separately installed local Hound sidecar.
 
 ## Can I run fully offline?
 
-No. The plugin calls external provider APIs for search and extraction. You can use a self-hosted SearXNG instance for the search provider, but the plugin still sends the query to that configured instance.
+No. The plugin calls external provider APIs for search and extraction. You can use a self-hosted SearXNG instance or local Hound sidecar, but searches and fetched URLs still produce outbound requests to public engines or destination websites. Local and keyless do not mean offline or anonymous.
 
 ## Does the plugin log or send results anywhere else?
 
 The normal data flow is:
 
 ```text
-Hermes tool call → web-search-plus plugin → configured provider API → plugin response → Hermes agent
+Hermes tool call → web-search-plus plugin → configured provider API or local Hound sidecar → plugin response → Hermes agent
 ```
 
 The plugin writes local cache files and provider health state under the cache directory. It does not add a separate analytics service. Provider APIs still receive the queries or URLs you ask them to process.
@@ -171,3 +191,5 @@ python3 search.py --query "best bookshelf speakers under 1000" --provider auto -
 ```
 
 Look for selected provider, provider scores, skipped providers, cooldown skips, and `auto_allow_excluded`.
+
+For `--explain-routing` and a generated reference of every routing class with its signals and provider preferences, see [Routing v2 Reference](ROUTING.md).

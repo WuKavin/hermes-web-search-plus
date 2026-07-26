@@ -1,5 +1,255 @@
 # Changelog
 
+## [Unreleased]
+
+### Fork additions
+- Added AnySearch search and extraction through the WSP 3.x Provider SDK without modifying the upstream provider dispatch core.
+- Added AnySearch scoring for general, Chinese, security, patent, finance, academic, legal, code, and documentation queries.
+- Fixed Chinese queries containing shared Han terms such as `今日` being misclassified as Japanese.
+- Kept Brave in the default automatic routing pool and changed the fork fallback provider to AnySearch.
+
+## [v3.3.0] — 2026-07-24
+
+### ✨ Added
+- Bounded heading-aware semantic spans: a query-relevant ATX Markdown heading now retains its own section, including deeper subheadings and query-free body text, through the next same-or-shallower heading. Selection remains deterministic and offset-safe, with a two-section cap and a hard 1,200-codepoint cap per heading section.
+- Research Mode now harvests provider completions as they arrive and can stop waiting once a conservative, configurable quality quorum has been reached. Public result and diagnostic order remain deterministic, while preempted providers are reported explicitly as `preempted_after_quorum` rather than disappearing.
+
+### ✨ v3.1 result enrichment
+- Added additive, provenance-safe cross-provider snippet aggregation for canonical-URL clusters. Every retained snippet fragment names its `observation_id` and `source_field`; the wire validator reconstructs aggregate text from the validated fragments and explicit separator. Identical/contained fragments are deterministically deduplicated and aggregate previews stop at 600 characters without losing fragment attribution.
+- Added provider-neutral heuristic `source_type` (`value`, `method`, `method_version`, `confidence`) plus explainable per-result `fetch_priority` tiers with closed reason codes derived from cluster consensus, rank, and source-type authority. These fields are structured hints, not truth or quality claims.
+- Aligned Hound search with extraction by preserving Hound's `source_type` signal for WSP's normalized heuristic projection; `fetch_relevance` and `engines_consensus` remain available as adapter evidence.
+
+### 🐛 Fixed
+- Explicit `--research-providers` now bypass the automatic-routing allowlist, matching explicit single-provider semantics while still honoring disabled, unconfigured, and cooldown safety gates. Cooldown omissions remain visible in both routing and quality receipts instead of silently disappearing.
+- Research quorum evidence now scans all unique candidates from completed providers instead of stopping after the first provider fills the public result target. Later providers can therefore satisfy the provider-diversity requirement while the returned result page remains capped normally.
+
+### Credits
+- The independently implemented heading-aware interaction is inspired by [Hound/Master-Fetch v11.2.0](https://github.com/dondai1234/master-fetch), the independent MIT project by [Bishesh Bhandari (`dondai1234`)](https://github.com/dondai1234). This recognizes respectful upstream collaboration; WSP does not import, fork, or copy Hound/Master-Fetch code.
+- Hound/Master-Fetch is an independent MIT project by Bishesh Bhandari ([`dondai1234`](https://github.com/dondai1234)), https://github.com/dondai1234/master-fetch. WSP ports and adapts the integration idea through its own adapter; this is not Robby's Hound code and does not bundle, fork, or claim ownership of Hound.
+- The completion-order and quality-quorum design adapts ideas from [Hound/Master-Fetch v11.2.0](https://github.com/dondai1234/master-fetch/releases/tag/v11.2.0), the independent MIT-licensed project by [Bishesh Bhandari (`dondai1234`)](https://github.com/dondai1234). The WSP implementation was reworked for its own provider, budget, provenance, and receipt contracts.
+
+## [v3.2.0] — 2026-07-22
+
+### ✨ Added
+- Added Hound as an optional local MCP provider for both source search and URL extraction. Hound remains explicit-only by default, and WSP connects to a separately installed loopback sidecar instead of bundling or importing Hound internals.
+- Added a dedicated Hound operator guide covering separate installation, loopback-only service configuration, explicit Search/Extract verification, keyless trade-offs, privacy boundaries, caching ownership, and deliberate auto-routing opt-in.
+
+### 🔒 Security and reliability
+- Restricted Hound endpoints to uncredentialed HTTP on `127.0.0.1` or `::1`; remote hosts, hostnames, URL userinfo, query strings, fragments, redirects, proxy-environment routing, and oversized MCP responses fail closed.
+- Project Hound transport, timeout, MCP, and malformed-payload failures into typed provider errors while preserving requested extraction cardinality and never promoting missing upstream content to success.
+- Disabled Hound's per-request cache through the adapter so WSP remains the authoritative routing, freshness, evidence-cache, and receipt layer.
+- Applied `auto_allow=false` consistently to search and extraction fallback, keeping Hound out of automatic traffic unless an operator opts in.
+- Aligned provider-benchmark eligibility with the same auto-allow gate, preventing configured explicit-only providers from being recommended for automatic priority before operator opt-in.
+
+### Credits
+- Hound is an independent MIT-licensed project created and maintained by [Bishesh Bhandari (`dondai1234`)](https://github.com/dondai1234). WSP 3.2 ships only its own MCP client adapter; Hound is installed and operated separately.
+- Thanks to the Hound project for the open MCP interface and constructive upstream collaboration around domain validation, canonical URL normalization, and content classification. See [3.2 Release Notes](docs/RELEASE_NOTES_V32.md) for the linked upstream work.
+
+## [v3.1.2] — 2026-07-21
+
+### 🐛 Fixed
+- Extraction requests served by discovered Provider-SDK extraction providers no longer fail closed inside the cache identity. SDK providers now contribute a deterministic identity derived from their spec and the non-secret scalar settings of their config section (credential-shaped keys are excluded, because the identity is persisted with cached evidence). Unknown, unregistered providers still fail closed.
+- The `providers.d` non-production gate now acts before module execution: modules declaring a literal `production=False` are skipped without being imported unless `WSP_SDK_ALLOW_NON_PRODUCTION` is set. Previously such modules were excluded from the registry but their module-level code still ran. The post-import gate remains as the authoritative backstop for dynamically computed flags.
+
+## [v3.1.1] — 2026-07-20
+
+### 🐛 Fixed
+- Refresh Operator Privacy provider provenance from the validated live registry so providers registered after the privacy module was imported can emit receipts without weakening the fail-closed rejection of unregistered provider IDs.
+- Isolate the opt-in Provider SDK fixture probe in a temporary cache root, preventing test receipts and cache entries from touching an operator's active WSP state.
+- Bring the contract schema generator back into parity with the 3.1 budget-preflight schema, so the generated-artifact CI gate no longer treats the published response schema as stale.
+- Stabilize receipt-journal concurrency tests with the journal's injected clock, removing wall-clock expiry from thread and cross-process retention assertions.
+
+## [v3.1.0] — 2026-07-20
+
+### ✨ Added
+- Added the `self_hosted` no-paid-key operating profile. Its runtime-derived auto pools use SearXNG and keyless Keenable, preserve explicit keyed overrides with visible result metadata, and expose offline profile prerequisites through `setup.py status`.
+- Added the additive-only WSP 3.x public Provider SDK (`wsp_sdk`) with automatic `providers.d` discovery, typed startup diagnostics, fail-closed duplicate IDs, shared provider conformance checks, and `setup.py new-provider` scaffolding. New provider modules supply their own formal adapters without core registry or dispatch edits; discovered providers remain explicit-only unless they explicitly opt into the existing auto-routing gate.
+- Added persisted, deterministic Shadow quality-policy observations for auto-routed searches. Classic Routing v2 remains authoritative; the new local Operator Console aggregate reports agreement and provider divergences without storing query text.
+- Added opt-in v3 budget preflight. Provider fan-out, daily ledger quota, request deadline, and extraction context are checked before provider execution, with typed receipt evidence for deterministic degradation or zero-attempt budget failures.
+- Added deterministic Diversity Score diagnostics for quality reports: registrable-domain coverage, canonical-URL duplication, near-duplicate snippets, and research-provider mix. Research-result reranking remains explicitly opt-in.
+- Added the versioned v3 extraction-cache identity contract: request-exact URL, budget, bounded-context, extraction-control, provider-endpoint, URL-policy and retained-storage variation; lossless extraction provenance/legacy alias round-trips; and fail-closed identity-version and corrupt-entry quarantine handling.
+- Added opt-in semantic span extraction on `web_extract_plus` (`spans`/`spans_query`): deterministic query-conditioned passage selection over the NFC-normalized cleaned text with a mechanical offset contract — Unicode codepoint indices, half-open `[start,end)`, slicing invariant, and `within_preview` flags valid against the retained full text (docs/V3_SPAN_CONTRACT.md).
+- Added the read-only Operator Console endpoint `/api/v3/provider-health`: per-provider daily trend buckets (samples, errors, error rate, result counts, median latency) aggregated from persisted adaptive samples, without provider calls or stored query text.
+
+### ⚠️ Deprecated
+- The legacy pre-v3 execution modules (`cache.py` search-response caching and the non-v3 projection paths they serve) are deprecated. All public tools already execute through the native v3 orchestrator; the legacy modules remain only as compatibility shims and are planned for removal no earlier than 3.2. Operators do not need to change anything — this is an advance notice, not a behavior change.
+
+## [v3.0.2] — 2026-07-14
+
+### Credits
+- #104 by @robbyczgw-cla — repaired and hardened the native v3 Research, Extract cache, bounded-context, retained full-text, and operator-receipt integration paths.
+
+### 🐛 Fixed
+- Restored true multi-provider Research Mode in the native v3/Hermes path. Research providers now execute as separate authoritative attempts, and source observations retain the provider-attempt provenance of each contributing backend.
+- Restored the complete public Research envelope and its single post-merge quality pass, bypassed the legacy lossy cache, classified started deadline overruns as cancelled attempts, degraded provider/extraction budget limits truthfully, and marked total fan-out failure as a failed response.
+- Preserved extracted page content, safe `raw_content` aliases, and per-result provider attribution on v3 cache hits instead of projecting extraction evidence as search-only snippets.
+- Keyed extraction cache entries on the complete requested URL list, attempt budget, effective context limits, and current URL/storage policy, while still enforcing the provider fan-out cap before execution. Lossy partial-error, raw-HTML, image, and provider-specific payloads now bypass cache writes.
+- Made retained full-text references content-versioned and revalidated them on cache hits, preventing a refresh of the same URL from silently changing older cached evidence.
+- Applied the global extraction context budget before v3 cache writes, operator receipts, and legacy Hermes projection, so cache misses and hits share the same deterministic fair-share output without writing requested URLs into operator receipts.
+
+### 📚 Docs
+- Removed stale Perplexity/Kilo credential and freshness claims from active plugin metadata and replaced obsolete provider-toggle examples.
+
+## [v3.0.1] — 2026-07-13
+
+### 🐛 Fixed
+- Fixed in-process engine loading when Hermes' host package root precedes an already-registered plugin path. The lazy loader now temporarily prioritizes Web Search Plus sibling modules and restores the exact original `sys.path`, preventing collisions with Hermes' `providers` package and avoiding a permanent subprocess fallback.
+
+## [v3.0.0] — 2026-07-13
+
+### 🚀 WSP 3.0 — Source-only evidence engine
+- Added the native source-only v3 evidence spine: frozen request/response contracts, lossless provider observations, complete attempt receipts, policy actions, cache-origin evidence, bounded context, typed errors, and marker-owned operational storage.
+- Added the local read-only Operator Console with loopback-only binding, startup-token authentication, privacy-filtered overview/receipt/benchmark APIs, and a runnable `python3 ui.py --port 8765` entrypoint.
+- Added dry-run-first legacy-state migration for `provider_health.json` plus `provider_stats.json`, with verified backups, transactional import, idempotent apply, and digest-checked rollback.
+- Added a formal provider-adapter protocol that fails closed on registry/signature drift, provider identity mismatch, malformed result envelopes, and non-source answer payloads.
+- Added direct extraction benchmarking with privacy-safe aggregate Console history and independent extraction-priority recommendations.
+- Added a two-level Classic-routing kill switch: `routing.policy_mode` plus the higher-priority `WSP_ROUTING_CLASSIC_ONLY=1` environment override.
+
+### 💥 Changed in 3.0
+- WSP is now mechanically source-only. Native Perplexity and Kilo Perplexity answer endpoints are no longer registered because they do not expose a verified source-only mode; the public surface is 12 search providers and 8 extraction providers.
+- Classic Routing v2 remains authoritative in 3.0. Full persisted shadow-observer evaluation and the self-hosted/no-paid-key profile are explicitly deferred to 3.1.
+- The Operator Console default state path now matches the engine's `v3/state.sqlite3` layout.
+- Brave Search is promoted to the default Routing v2 auto-pool for independent-index source diversity; its free-tier quota and rate limits use the same existing provider cooldown and fallback handling as the other free-tier auto providers.
+
+### 🎯 What 3.0 improves in practice
+- Every result is easier to audit: typed provenance connects it to the underlying source observation, while provider attempts, retries, skips, and cache origin remain visible.
+- Long pages no longer need to flood agent context: extraction returns a bounded preview and keeps the full cleaned text available on demand.
+- Provider failures become legible: missing credentials, rate limits, timeouts, empty results, and unapplied filters are represented explicitly instead of disappearing into silent gaps.
+- Upgrades are safer to try: state migration starts with a dry run, backs up existing state before writing, and supports digest-verified rollback.
+- Routing gains independent-index diversity without a surprise policy switch: Classic Routing v2 remains authoritative while Brave joins the default auto-pool.
+- Operators gain local, read-only visibility into routing receipts, provider readiness, cache state, and applied limits without triggering provider calls or configuration writes.
+
+### ✨ Added before 3.0, carried forward
+- Added independent `auto_routing.extract_provider_priority` configuration for `web_extract_plus(provider="auto")`, with `setup.py config set-extract-priority ...`. The existing Tavily-first registry order remains the public default; partial lists append missing extract-capable providers, and search `provider_priority` remains independent.
+
+### 📚 Docs
+- Added 3.0 migration, compatibility, backup/restore, Operator Console, benchmark, and release-note guides.
+
+## [v2.9.1] — 2026-07-10
+
+### Credits
+- #82 by @robbyczgw-cla — synchronized the last stale v2.9.0 User-Agent version surface.
+- #83 by @robbyczgw-cla — added the atomic release-version preparation helper and regression tests.
+- #84 by @robbyczgw-cla — aligned Serper extraction documentation and streamlined the README.
+- #86 by @robbyczgw-cla — raised Parallel extraction content budgets for fair long-page handling.
+- v2.9.1 maintenance by @robbyczgw-cla — protected shared provider/usage state from cache stats and clear operations.
+
+### 🔧 Improved
+- Raised Parallel extraction's default `full_content` budget to 60k characters per result / 120k total so long pages are evaluated fairly against other extraction providers instead of being silently capped at 6k. Operators that need smaller Parallel payloads can set `parallel.max_chars_per_result` and `parallel.max_chars_total` in `config.json`. (#86)
+- Added `scripts/prepare_release.py`: bumps every release-version surface in one step (plugin.yaml, `__version__`, header docstrings, User-Agent, the test gate, and the CHANGELOG section) with a dry-run default and loud failure on surface drift. The hardcoded release gate now lives in exactly one place (`tests/test_release_metadata.py`), while package-import and HTTP-client tests read the expected version dynamically from `plugin.yaml`. (#83)
+
+### 🐛 Fixed
+- Synchronized the default HTTP User-Agent with v2.9.0, closing the last stale release-version surface left after that tag. (#82)
+- Cache statistics and clearing now recognize only complete WSP search-cache envelopes. Shared state such as `provider_stats.json`, `provider_health.json`, host-written `usage_events.json`, unrelated JSON, and corrupt foreign files is ignored and preserved byte-for-byte instead of being counted, deleted, or crashing cache stats.
+
+### 📚 Docs
+- Marked Serper extraction consistently across the README, architecture, and user guide, and slimmed the README into a clearer product landing page. (#84)
+
+## [v2.9.0] — 2026-07-03
+
+### Credits
+- #75 by @robbyczgw-cla — cwd-independent plugin import fix for Hermes standalone discovery.
+- #77 by @robbyczgw-cla — golden snapshot recorder and expanded snapshot suite.
+- #79 by @robbyczgw-cla — registry-driven provider dispatch (separates routing from provider execution).
+- #80 by @robbyczgw-cla — Serper news endpoint and webpage scraper extraction.
+- #81 by @robbyczgw-cla — configurable search locale defaults with lightweight query language detection.
+
+### ✨ Added
+- Golden snapshot evaluation recorder and expanded snapshot suite: record golden snapshots for regression testing, with expanded query coverage across providers. See `scripts/golden_eval.py`. (#77)
+- Added a unified `search_type` parameter to `web_search_plus` (`search` or `news`). Serper serves the news vertical natively via `google.serper.dev/news` (the unified `freshness` filter keeps working there); all other providers run their normal search and report `search_type.applied=false` in result metadata, mirroring the `freshness` contract. CLI: `--search-type`.
+- Serper is now an extraction provider: `web_extract_plus(provider="serper")` scrapes pages via Serper's webpage scraper (`https://scrape.serper.dev`, markdown preferred, per-URL error items). It joins the auto-extraction fallback chain in last position — Tavily-first ordering is unchanged. The endpoint is operator-overridable via config `serper.scrape_url` (with `serper.extract_timeout`).
+- Configurable search locale defaults with lightweight query language detection. A new `defaults.locale` config section (`country`: ISO 3166-1 alpha-2, `language`: ISO 639-1 or `"auto"`) replaces the hardcoded us/en provider defaults for Serper, Brave, You.com, SerpBase, Querit, Firecrawl, and SearXNG. Resolution is config-first for the region and query-aware for the language: CLI/tool flags > explicit provider config > explicit location hint in the query (curated city/country table, e.g. "mejores restaurantes Madrid" → `es`) > `defaults.locale` > us/en fallback. With `language: "auto"`, a conservative stdlib stopword/character heuristic infers `de`, `es`, `fr`, `it`, `pt`, `nl`, or `en` (at least two distinct signals with a single unambiguous winner; terse technical queries like "PostgreSQL 17 release notes" keep the default). Query language never implies the country — a German query may come from Austria or Switzerland, so only explicit location hints move the region. Result metadata reports the resolved locale and per-value source (`config|hint|cli|fallback` / `config|inferred|cli|fallback`). Without `defaults.locale` and flags, behavior stays exactly us/en.
+
+### 🔧 Improved
+- Registry-driven provider dispatch: separates routing from provider execution. Provider-specific search/extract logic lives in `provider_dispatch.py` instead of being scattered through `routing.py`. (#79)
+
+### 🐛 Fixed
+- Plugin discovery no longer depends on the current working directory when Hermes loads the flat plugin from outside the plugin directory. (#75)
+- `serper.type = "news"` (and the new `search_type="news"`) no longer returns silently empty results: Serper `/news` answers carry results under `news` instead of `organic`, and the parser now reads the right field, including `date`, `source`, thumbnail, and position metadata.
+
+## [v2.8.1] — 2026-07-02
+
+### Credits
+- #75 by @robbyczgw-cla — cwd-independent plugin import fix for Hermes standalone discovery.
+
+### 🐛 Fixed
+- Web Search Plus plugin discovery no longer depends on the current working directory when Hermes loads the flat plugin from outside the plugin directory. The plugin root is added as a fallback import path so sibling modules such as `provider_registry` resolve under Hermes Agent v0.18 standalone discovery without shadowing host modules.
+
+## [v2.8.0] — 2026-07-02
+
+### Credits
+- #65 by @robbyczgw-cla — truncate-and-store handling for large `web_extract_plus` pages.
+- #66 by @robbyczgw-cla — provider/decode/read-timeout error classification.
+- #67 by @robbyczgw-cla — `.env` and cache permission hardening plus tighter CI workflow defaults.
+- #68 by @robbyczgw-cla — look-alike domain boost hardening.
+- #69 by @robbyczgw-cla — generated provider reference and drift check.
+- #70 by @robbyczgw-cla — generated Routing v2 reference and drift check.
+- #71 by @robbyczgw-cla — unified `freshness` parameter for `web_search_plus`.
+- #72 by @robbyczgw-cla — provider bench and `provider_priority` recommendation command.
+
+### ✨ Added
+- `web_extract_plus` now uses truncate-and-store output handling for large extracted pages: short pages are returned in full, while long pages return a head/tail window plus a page-on-demand footer pointing to the full cleaned text stored under `cache/web`. Configure the inline budget with `web.extract_char_limit` (default `15000`). (#65)
+- Added a unified `freshness` parameter to `web_search_plus` (`day`, `week`, `month`, `year`). Providers with native date filters receive the mapped value; providers without support transparently report that freshness was not applied instead of pretending recency was enforced. (#71)
+- Added a provider bakeoff command — `python3 search.py --bench` (or `search.py bench` / `setup.py bench`) — that runs a small fixed query suite (docs, vendor release, community, non-English) against every configured search provider in-process and reports success rate, median latency, result volume, and quality signals (duplicate-free URLs, snippet coverage). It prints a ranked `auto_routing.provider_priority` recommendation with the exact `config set-priority` command to apply it; config is never written automatically, and bench traffic never triggers provider cooldowns or feeds adaptive routing stats. (#72)
+- Added generated Provider and Routing v2 reference docs, plus drift checks so the public docs stay aligned with the provider registry and routing configuration. (#69, #70)
+
+### 🛡️ Security
+- Domain boost matching now avoids granting authority boosts to look-alike domains that merely contain a trusted domain string (for example `example.com.evil.test`). (#68)
+- Setup-created `.env` files are written with `0600` permissions, cache directories are created with `0700`, and the CI workflow uses tighter token permissions/concurrency defaults. (#67)
+
+### 🔧 Improved
+- Inline base64 image data in extracted Markdown is replaced with `[IMAGE: alt]` placeholders before measuring/storing content, preventing data-URI token bombs while preserving normal `http(s)` image links. (#65)
+- Provider decode failures and Python 3.8/3.9 read-timeout behavior are classified as provider errors, improving retry/fallback behavior and error clarity. (#66)
+
+## [v2.7.0] — 2026-06-30
+
+### Credits
+- #60 by @IlyaGusev — keyless public-tier setup flow for keyless providers.
+- #61 by @robbyczgw-cla — private/internal extraction target URL guard.
+- #62 by @robbyczgw-cla — public-Hermes fast-path advisory doctor.
+- #63 by @robbyczgw-cla — prevent provider config errors from marking provider health cooldowns.
+- #59 by @robbyczgw-cla — README hero refresh and Querit signup URL correction carried forward from the v2.6.1 post-release range.
+
+### ✨ Added
+- Added `setup.py fastpath`, a dependency-free advisory doctor that checks whether Web Search Plus is installed for direct Hermes tool registration and whether current public-Hermes config (`agent.disabled_toolsets: [web]`) is present for lower-latency routing without requiring Hermes core patches. (#62)
+- The setup wizard now offers the keyless public tier for keyless providers (currently Keenable): skip the key prompt and it asks whether to enable the no-key public endpoint, writing `<provider>.allow_public: true` to `config.json`. Add `--keyless-public` to skip that confirmation prompt and opt in directly. The mechanism is driven by the registry's keyless flag, so it covers future keyless providers automatically. (#60)
+
+### 🛡️ Security
+- `web_extract_plus` now rejects private/internal extraction target URLs by default before provider dispatch, blocking loopback, RFC1918, CGNAT/shared-address ranges, IPv6 ULA/link-local/mapped-private addresses, multicast, cloud metadata, and hostnames that resolve to private IPs. Operator-configured provider endpoints (for example a local Firecrawl-compatible backend) remain allowed; trusted intranet extraction can be opted into with `extract.allow_private_urls: true` in `config.json`. (#61)
+
+### 🐛 Fixed
+- A routing-config rewrite (e.g. `config set-priority`, `config reset`) no longer drops non-routing provider sections from `config.json` (e.g. `keenable.allow_public`, `keenable.search_url`, `searxng.instance_url`); the writer now merges routing keys onto the existing file instead of rebuilding it from routing defaults. (#60)
+- Provider configuration errors such as missing API keys no longer mark providers unhealthy or put them into cooldown. Cooldown now stays reserved for real provider/network failures. (#63)
+- Corrected the Querit provider `signup_url` from the dead `querit.com` to `querit.ai`. (#59)
+
+### 📚 Docs
+- Documented the current public-Hermes fast-path config and the new `setup.py fastpath` checker for users who want lower perceived latency without local Hermes core patches. (#62)
+- Refreshed the README hero graphic for v2.7.0 with the current 14 search / 7 extraction provider taxonomy. (#59)
+
+## [v2.6.1] — 2026-06-26
+
+### Credits
+- #57 by @robbyczgw-cla — GroktoCrawl / local Firecrawl-compatible backend documentation and endpoint override tests.
+
+### 📚 Docs
+- Documented using Firecrawl-v2-compatible local backends such as GroktoCrawl by overriding the existing Firecrawl search and scrape URLs in `config.json`.
+- Corrected the v2.6.0 changelog history to include #55 and #56 attribution after the GitHub Release notes were also fixed.
+
+### 🧪 Tests
+- Added Firecrawl provider tests covering custom search and scrape endpoint overrides so local-compatible backends stay on the same wire path as Firecrawl cloud.
+
+## [v2.6.0] — 2026-06-26
+
+### Credits
+- #55 by @maksym-mishchenko — in-process loader fix for `sys.modules` name collisions with host packages.
+- #56 by @IlyaGusev — Keenable search and extraction provider with keyed endpoints plus an opt-in keyless public tier.
+
+### 🐛 Fixed
+- Fixed in-process loading when the host runtime already has top-level modules such as `providers` in `sys.modules`, preventing host/package name collisions from forcing the plugin onto the subprocess fallback path. (#55)
+
+### ✨ Added
+- Added Keenable as a search and extraction provider, using Keenable's independent web index. Setting `KEENABLE_API_KEY` (or `keenable.api_key` in `config.json`) uses the authenticated endpoints (with an `X-API-Key` header). It can also run keyless against the `/v1/search/public` and `/v1/fetch/public` endpoints, but this is **opt-in and off by default** — enable it with `keenable.allow_public: true` in `config.json` or `KEENABLE_ALLOW_PUBLIC=1`, since the public tier routes queries and fetched URLs to an unauthenticated service (~1000 req/hour, 10 req/sec per-IP limits, no SLA) and emits a one-time warning when first used. Once configured (keyed or opted-in), Keenable is available via `provider="keenable"` and as the lowest-priority auto-routing/extraction fallback, so it never displaces a configured keyed provider. Key status stays truthful — keyless providers report `key=no` with a distinct keyless badge in `doctor`. (#56)
+
 ## [v2.5.1] — 2026-06-16
 
 ### 🐛 Fixed

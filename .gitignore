@@ -1,6 +1,7 @@
 # API keys and secrets — NEVER commit
 .env
 config.json
+.venv-wt/
 
 # Cache / generated local reports
 .cache/
@@ -13,3 +14,6 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+
+# Node.js development dependencies
+node_modules/

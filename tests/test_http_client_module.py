@@ -1,11 +1,12 @@
 import gzip
 import json
+import socket
 import time
 from email.message import Message
 from email.utils import formatdate
 from io import BytesIO
 from unittest import mock
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 
 import pytest
 
@@ -52,7 +53,15 @@ def test_http_client_provider_request_error_exports_retry_metadata():
 
 
 def test_default_user_agent_uses_release_version():
-    assert http_client.DEFAULT_USER_AGENT == "ClawdBot-WebSearchPlus/2.5.1"
+    # Dynamic on purpose: the single hardcoded release gate lives in
+    # test_release_metadata.py and covers the User-Agent as well.
+    import re
+    from pathlib import Path
+
+    plugin_yaml = (Path(__file__).resolve().parents[1] / "plugin.yaml").read_text(encoding="utf-8")
+    match = re.search(r'^version:\s*"(\d+\.\d+\.\d+)"\s*$', plugin_yaml, re.MULTILINE)
+    assert match, "could not read version from plugin.yaml"
+    assert http_client.DEFAULT_USER_AGENT == f"ClawdBot-WebSearchPlus/{match.group(1)}"
 
 
 def _make_http_error(code: int, headers=None, body: bytes = b"{}") -> HTTPError:
@@ -99,3 +108,71 @@ def test_service_unavailable_error_has_no_retry_after():
     assert error.status_code == 503
     assert error.transient is True
     assert error.retry_after is None
+
+
+def test_socket_timeout_is_classified_transient():
+    # socket.timeout is only a TimeoutError alias on Python 3.10+; a raw
+    # read timeout on 3.8/3.9 must still map to a transient provider error.
+    for func in (
+        lambda: http_client.make_request("https://api.example.com/search", {}, {"q": "test"}),
+        lambda: http_client.make_get_request("https://api.example.com/search", {}),
+    ):
+        with mock.patch("http_client.urlopen", side_effect=socket.timeout("timed out")):
+            with pytest.raises(http_client.ProviderRequestError) as exc_info:
+                func()
+        assert exc_info.value.transient is True
+
+
+def test_urlerror_wrapping_socket_timeout_is_transient():
+    # The reason's str() ("_") does not contain "timed out"; classification
+    # must rely on the exception type, not the message text.
+    with mock.patch("http_client.urlopen", side_effect=URLError(socket.timeout("_"))):
+        with pytest.raises(http_client.ProviderRequestError) as exc_info:
+            http_client.make_request("https://api.example.com/search", {}, {"q": "test"})
+    assert exc_info.value.transient is True
+
+
+def test_invalid_json_response_raises_provider_error():
+    with mock.patch("http_client.urlopen", return_value=FakeResponse(b"<html>bad gateway</html>")):
+        with pytest.raises(http_client.ProviderRequestError) as exc_info:
+            http_client.make_get_request("https://api.example.com/search", {})
+    assert exc_info.value.transient is True
+
+
+def test_non_utf8_response_raises_provider_error():
+    with mock.patch("http_client.urlopen", return_value=FakeResponse(b"\xff\xfe\xfa")):
+        with pytest.raises(http_client.ProviderRequestError) as exc_info:
+            http_client.make_get_request("https://api.example.com/search", {})
+    assert exc_info.value.transient is True
+
+
+def test_corrupt_gzip_response_raises_provider_error():
+    response = FakeResponse(b"\x1f\x8bgarbage", {"Content-Encoding": "gzip"})
+    with mock.patch("http_client.urlopen", return_value=response):
+        with pytest.raises(http_client.ProviderRequestError) as exc_info:
+            http_client.make_get_request("https://api.example.com/search", {})
+    assert exc_info.value.transient is True
+
+
+def test_corrupt_deflate_response_raises_provider_error():
+    response = FakeResponse(b"not-deflate", {"Content-Encoding": "deflate"})
+    with mock.patch("http_client.urlopen", return_value=response):
+        with pytest.raises(http_client.ProviderRequestError) as exc_info:
+            http_client.make_get_request("https://api.example.com/search", {})
+    assert exc_info.value.transient is True
+
+
+def test_http_error_with_corrupt_body_still_reports_status():
+    error = _make_http_error(500, {"Content-Encoding": "gzip"}, body=b"\x1f\x8bgarbage")
+    with mock.patch("http_client.urlopen", side_effect=error):
+        with pytest.raises(http_client.ProviderRequestError) as exc_info:
+            http_client.make_request("https://api.example.com/search", {}, {"q": "test"})
+    assert exc_info.value.status_code == 500
+
+
+def test_http_error_with_non_utf8_body_does_not_crash_detail_extraction():
+    error = _make_http_error(500, body=b"\xff\xfe server exploded")
+    with mock.patch("http_client.urlopen", side_effect=error):
+        with pytest.raises(http_client.ProviderRequestError) as exc_info:
+            http_client.make_request("https://api.example.com/search", {}, {"q": "test"})
+    assert exc_info.value.status_code == 500

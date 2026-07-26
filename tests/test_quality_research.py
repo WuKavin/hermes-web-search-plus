@@ -1,9 +1,37 @@
+import threading
+import time
 import unittest
+from copy import deepcopy
 
 import search
+from config import DEFAULT_CONFIG, _validate_runtime_config
 
 
 class QualityReportTests(unittest.TestCase):
+    def test_research_quorum_config_defaults_disable_and_bounds(self):
+        config = _validate_runtime_config(deepcopy(DEFAULT_CONFIG))
+        self.assertEqual(
+            search._research_quorum_settings(config),
+            {
+                "enabled": True,
+                "min_contributing_providers": 2,
+                "result_target_cap": 5,
+                "min_unique_domains": 3,
+            },
+        )
+
+        config["quality"]["research_quorum"]["enabled"] = False
+        self.assertFalse(
+            search._research_quorum_settings(
+                _validate_runtime_config(config)
+            )["enabled"]
+        )
+
+        invalid = deepcopy(DEFAULT_CONFIG)
+        invalid["quality"]["research_quorum"]["min_contributing_providers"] = 1
+        with self.assertRaisesRegex(ValueError, "min_contributing_providers"):
+            _validate_runtime_config(invalid)
+
     def test_quality_report_scores_domain_diversity_and_extract_need(self):
         result = {
             "results": [
@@ -320,6 +348,169 @@ class ResearchModeTests(unittest.TestCase):
 
         self.assertEqual(result["routing"]["providers_queried"], ["slow", "fast"])
         self.assertEqual(result["routing"]["provider_errors"], [])
+
+    def test_research_mode_returns_after_quality_quorum_without_waiting_for_blocked_provider(self):
+        slow_started = threading.Event()
+        release_slow = threading.Event()
+        fast_b_finished = threading.Event()
+
+        def execute(provider):
+            if provider == "slow":
+                slow_started.set()
+                release_slow.wait(5)
+                return {"provider": provider, "results": [{"url": "https://slow.test/a"}]}
+            self.assertTrue(slow_started.wait(1))
+            if provider == "fast-b":
+                fast_b_finished.set()
+                return {"provider": provider, "results": [
+                    {"url": "https://three.test/b"},
+                    {"url": "https://four.test/b"},
+                ]}
+            self.assertTrue(fast_b_finished.wait(1))
+            return {"provider": provider, "results": [
+                {"url": "https://one.test/a"},
+                {"url": "https://two.test/a"},
+            ]}
+
+        try:
+            started = time.monotonic()
+            result = search.run_research_mode(
+                query="quorum returns early",
+                research_providers=["slow", "fast-a", "fast-b"],
+                execute_search=execute,
+                extract_urls=lambda urls: {"provider": None, "results": []},
+                max_results=3,
+                max_extract_urls=0,
+                time_budget_seconds=2,
+            )
+            elapsed = time.monotonic() - started
+        finally:
+            release_slow.set()
+
+        # fast-b completes before fast-a, but the public merge order remains
+        # submission order. The blocked daemon task is explicitly preempted.
+        self.assertLess(elapsed, 1.0)
+        self.assertEqual(result["routing"]["providers_queried"], ["fast-a", "fast-b"])
+        self.assertEqual([item["url"] for item in result["results"]], [
+            "https://one.test/a",
+            "https://two.test/a",
+            "https://three.test/b",
+        ])
+        self.assertIn(
+            {"provider": "slow", "error": "preempted_after_quorum"},
+            result["routing"]["provider_errors"],
+        )
+        self.assertTrue(result["metadata"]["research_quorum"]["triggered"])
+
+    def test_research_mode_does_not_preempt_for_one_successful_provider(self):
+        result = search.run_research_mode(
+            query="one provider cannot form a quorum",
+            research_providers=["only"],
+            execute_search=lambda provider: {
+                "provider": provider,
+                "results": [{"url": "https://one.test/a"}],
+            },
+            extract_urls=lambda urls: {"provider": None, "results": []},
+            max_results=1,
+            max_extract_urls=0,
+        )
+
+        self.assertEqual(result["routing"]["providers_queried"], ["only"])
+        self.assertEqual(result["routing"]["provider_errors"], [])
+        self.assertFalse(result["metadata"]["research_quorum"]["triggered"])
+
+    def test_research_mode_does_not_preempt_when_domains_are_not_diverse(self):
+        def execute(provider):
+            if provider == "slow":
+                time.sleep(1)
+            return {"provider": provider, "results": [
+                {"url": f"https://same.test/{provider}/a"},
+                {"url": f"https://same.test/{provider}/b"},
+                {"url": f"https://same.test/{provider}/c"},
+            ]}
+
+        result = search.run_research_mode(
+            query="poor diversity cannot form a quorum",
+            research_providers=["fast-a", "fast-b", "slow"],
+            execute_search=execute,
+            extract_urls=lambda urls: {"provider": None, "results": []},
+            max_results=3,
+            max_extract_urls=0,
+            time_budget_seconds=0.1,
+        )
+
+        self.assertNotIn(
+            {"provider": "slow", "error": "preempted_after_quorum"},
+            result["routing"]["provider_errors"],
+        )
+        self.assertIn(
+            {"provider": "slow", "error": "timed out: research time budget exhausted"},
+            result["routing"]["provider_errors"],
+        )
+        self.assertFalse(result["metadata"]["research_quorum"]["triggered"])
+
+    def test_research_mode_waits_for_small_result_sets_to_preserve_recall(self):
+        release_slow = threading.Event()
+        done = threading.Event()
+        outcome = {}
+
+        def execute(provider):
+            if provider == "slow":
+                release_slow.wait(1)
+                return {"provider": provider, "results": [
+                    {"url": "https://three.test/a"},
+                    {"url": "https://four.test/a"},
+                    {"url": "https://five.test/a"},
+                ]}
+            return {"provider": provider, "results": [{"url": f"https://{provider}.test/a"}]}
+
+        def run():
+            try:
+                outcome["result"] = search.run_research_mode(
+                    query="small result sets keep recall",
+                    research_providers=["fast-a", "fast-b", "slow"],
+                    execute_search=execute,
+                    extract_urls=lambda urls: {"provider": None, "results": []},
+                    max_results=5,
+                    max_extract_urls=0,
+                )
+            finally:
+                done.set()
+
+        runner = threading.Thread(target=run)
+        runner.start()
+        try:
+            self.assertFalse(done.wait(0.1))
+        finally:
+            release_slow.set()
+        self.assertTrue(done.wait(1))
+        runner.join(1)
+
+        result = outcome["result"]
+        self.assertEqual(len(result["results"]), 5)
+        self.assertEqual(result["routing"]["provider_errors"], [])
+        self.assertFalse(result["metadata"]["research_quorum"]["triggered"])
+
+    def test_research_mode_provider_errors_keep_submission_order(self):
+        delays = {"first": 0.03, "second": 0.01}
+
+        def execute(provider):
+            time.sleep(delays[provider])
+            raise RuntimeError(f"{provider} failed")
+
+        result = search.run_research_mode(
+            query="stable diagnostics",
+            research_providers=["first", "second"],
+            execute_search=execute,
+            extract_urls=lambda urls: {"provider": None, "results": []},
+            max_results=3,
+            max_extract_urls=0,
+        )
+
+        self.assertEqual(
+            [item["provider"] for item in result["routing"]["provider_errors"]],
+            ["first", "second"],
+        )
 
 
 if __name__ == "__main__":

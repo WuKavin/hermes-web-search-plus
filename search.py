@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
 Web Search Plus — Unified Multi-Provider Search and Extraction with Intelligent Auto-Routing
-Version: 2.5.1
+Version: 3.3.0
 Supports search providers: You.com, Serper, Exa, Firecrawl, Tavily, Linkup,
-Brave Search, SerpBase, Querit, Parallel, Perplexity, Kilo Perplexity, SearXNG.
-Supports extract providers: Firecrawl, Linkup, Parallel, Tavily, Exa, You.com.
+Brave Search, SerpBase, Querit, Parallel, SearXNG, Keenable.
+Supports extract providers: Firecrawl, Linkup, Parallel, Tavily, Exa, You.com, Keenable, Serper.
 
 Smart Routing uses multi-signal analysis:
   - Routing v2 language/script and query-class detection
@@ -16,7 +16,7 @@ Smart Routing uses multi-signal analysis:
 
 Usage:
     python3 search.py --query "..."                    # Auto-route based on query
-    python3 search.py --provider [you|serper|exa|firecrawl|tavily|linkup|brave|serpbase|querit|perplexity|kilo-perplexity|searxng|auto] --query "..." [options]
+    python3 search.py --provider [you|serper|exa|firecrawl|tavily|linkup|brave|serpbase|querit|searxng|auto] --query "..." [options]
 
 Examples:
     python3 search.py -q "東京 AI ニュース 今日"              # → You.com (multilingual current)
@@ -24,11 +24,14 @@ Examples:
     python3 search.py -q "latest OpenSSH CVE mitigation"    # → Serper (security/current)
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import os
 import sys
 import time
+from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 from http_client import (  # noqa: F401 - re-exported for backward-compatible tests/imports
     ProviderRequestError,
@@ -49,12 +52,17 @@ from cache import (
 from config import (  # noqa: F401 - re-exported for backward-compatible tests/imports
     DEFAULT_CONFIG,
     ProviderConfigError,
+    SELF_HOSTED_SEARCH_PROVIDER_IDS,
     _clean_env_value,
     _deepcopy_default_config,
     _validate_runtime_config,
     _validate_searxng_url,
+    apply_profile_effects,
     get_api_key,
+    is_self_hosted_profile,
+    keyless_public_allowed,
     load_config,
+    provider_configured,
     validate_api_key,
 )
 from provider_health import (  # noqa: F401 - re-exported for backward-compatible tests/imports
@@ -79,12 +87,38 @@ from quality import (  # noqa: F401 - re-exported for backward-compatible tests/
     rerank_results_for_intent,
     select_research_providers,
 )
-from provider_registry import SEARCH_PROVIDER_IDS, doctor_catalog
+from diversity_v3 import DEFAULT_NEAR_DUPLICATE_THRESHOLD
+from provider_adapter_protocol import validate_adapter_result
+from provider_dispatch import SEARCH_DISPATCH
+from provider_registry import (
+    EXTRACT_PROVIDER_IDS,
+    PROVIDER_STARTUP_DIAGNOSTICS,
+    PROVIDER_SPECS,
+    SEARCH_PROVIDER_IDS,
+    doctor_catalog,
+)
+from request_gate_v3 import validate_provider_mode
+from search_locale import provider_supports_locale, resolve_locale
 from env_loader import load_env_files
 from research import run_research_mode
+from attempt_engine_v3 import AttemptContext, AttemptEngine
+from cache_v3 import peek_legacy_search
+from compat_v3 import legacy_request_to_v3, v3_response_to_legacy_search
+from contract_v3 import Capability, RequestV3, ResponseV3, SkipReason
+from orchestrator_v3 import (
+    CapabilityAdapter,
+    CapabilityExecution,
+    ProviderPlan,
+    execute_v3_request,
+)
+from runtime_v3 import response_from_legacy
+from state_store_v3 import SQLiteStateStore
 import providers as _providers
 import routing as _routing
 import extract as _extract
+import bench as _bench
+import extract_bench_v3 as _extract_bench
+import state_migration_v3 as _state_migration
 
 # Backward-compatible cache helper aliases for older imports/tests.
 get_cached_result = cache_get
@@ -282,6 +316,44 @@ def _sync_provider_dependencies() -> None:
     _providers.execute_provider_with_retry = execute_provider_with_retry
 
 
+# Unified freshness helpers (re-exported for tests and callers).
+FRESHNESS_VALUES = _providers.FRESHNESS_VALUES
+PROVIDER_FRESHNESS_FORMATS = _providers.PROVIDER_FRESHNESS_FORMATS
+
+
+def normalize_freshness(*args, **kwargs):
+    return _providers.normalize_freshness(*args, **kwargs)
+
+
+def provider_supports_freshness(*args, **kwargs):
+    return _providers.provider_supports_freshness(*args, **kwargs)
+
+
+def map_freshness_for_provider(*args, **kwargs):
+    return _providers.map_freshness_for_provider(*args, **kwargs)
+
+
+def freshness_metadata(*args, **kwargs):
+    return _providers.freshness_metadata(*args, **kwargs)
+
+
+# Unified search_type helpers (re-exported for tests and callers).
+SEARCH_TYPE_VALUES = _providers.SEARCH_TYPE_VALUES
+PROVIDER_SEARCH_TYPES = _providers.PROVIDER_SEARCH_TYPES
+
+
+def normalize_search_type(*args, **kwargs):
+    return _providers.normalize_search_type(*args, **kwargs)
+
+
+def provider_supports_search_type(*args, **kwargs):
+    return _providers.provider_supports_search_type(*args, **kwargs)
+
+
+def search_type_metadata(*args, **kwargs):
+    return _providers.search_type_metadata(*args, **kwargs)
+
+
 def search_serper(*args, **kwargs):
     _sync_provider_dependencies()
     return _providers.search_serper(*args, **kwargs)
@@ -392,14 +464,19 @@ def search_searxng(*args, **kwargs):
     return _providers.search_searxng(*args, **kwargs)
 
 
-def search_anysearch(*args, **kwargs):
+def search_keenable(*args, **kwargs):
     _sync_provider_dependencies()
-    return _providers.search_anysearch(*args, **kwargs)
+    return _providers.search_keenable(*args, **kwargs)
 
 
-def extract_anysearch(*args, **kwargs):
+def extract_keenable(*args, **kwargs):
     _sync_provider_dependencies()
-    return _providers.extract_anysearch(*args, **kwargs)
+    return _providers.extract_keenable(*args, **kwargs)
+
+
+def extract_serper(*args, **kwargs):
+    _sync_provider_dependencies()
+    return _providers.extract_serper(*args, **kwargs)
 
 
 
@@ -456,9 +533,12 @@ def _sync_extract_dependencies() -> None:
     _extract.extract_exa = extract_exa
     _extract.extract_you = extract_you
     _extract.extract_parallel = extract_parallel
+    _extract.extract_keenable = extract_keenable
+    _extract.extract_serper = extract_serper
 
 
 EXTRACT_PROVIDER_PRIORITY = _extract.EXTRACT_PROVIDER_PRIORITY
+resolve_extract_provider_priority = _extract.resolve_extract_provider_priority
 
 
 PROVIDER_DOCTOR_CATALOG = doctor_catalog()
@@ -510,12 +590,18 @@ def _build_doctor_report(config: Dict[str, Any], *, live: bool = False) -> Dict[
             key_present = False
             errors.append(_doctor_error("config", "invalid provider configuration"))
 
+        spec_obj = PROVIDER_SPECS.get(provider)
+        keyless = bool(spec_obj and spec_obj.keyless)
+        keyless_enabled = keyless and keyless_public_allowed(provider, config)
+
         provider_report = {
             "provider": provider,
             "env_var": spec["env_var"],
             "search_capable": spec["search_capable"],
             "extract_capable": spec["extract_capable"],
             "key_present": key_present,
+            "keyless": keyless,
+            "keyless_public_enabled": keyless_enabled,
             "auto_allowed": _provider_auto_allowed(provider, auto_config),
             "disabled": provider in disabled,
             "cooldown": cooldown,
@@ -524,7 +610,7 @@ def _build_doctor_report(config: Dict[str, Any], *, live: bool = False) -> Dict[
             provider_report["error"] = errors[0] if len(errors) == 1 else errors
         providers.append(provider_report)
 
-    usable = [p for p in providers if p["key_present"] and not p["disabled"]]
+    usable = [p for p in providers if (p["key_present"] or p["keyless_public_enabled"]) and not p["disabled"]]
     config_errors = [p for p in providers if _doctor_provider_has_error_type(p, "config")]
     return {
         "ok": bool(usable) and not config_errors,
@@ -542,7 +628,24 @@ def _build_doctor_report(config: Dict[str, Any], *, live: bool = False) -> Dict[
             "provider_health_file": str(CACHE_DIR / "provider_health.json"),
         },
         "providers": providers,
+        "startup_diagnostics": [
+            {"module": diagnostic.module, "code": diagnostic.code}
+            for diagnostic in PROVIDER_STARTUP_DIAGNOSTICS
+        ],
     }
+
+
+def run_provider_bench(config: Dict[str, Any], **kwargs) -> Dict[str, Any]:
+    """Run the in-process provider bakeoff (see bench.py) and return its report.
+
+    Passes this module as the provider seam so bench honours the same
+    monkeypatch surface as the rest of the pipeline (``search.search_you``
+    etc.), and never records provider health cooldowns or provider stats.
+    """
+    return _bench.run_bench(config, search_module=sys.modules[__name__], **kwargs)
+
+
+format_bench_text = _bench.format_bench_text
 
 
 def _format_doctor_text(report: Dict[str, Any]) -> str:
@@ -555,9 +658,13 @@ def _format_doctor_text(report: Dict[str, Any]) -> str:
             capabilities.append("extract")
         cooldown = provider["cooldown"]
         cooldown_text = f"cooldown {cooldown['remaining_seconds']}s" if cooldown["active"] else "no cooldown"
+        keyless_text = ""
+        if provider.get("keyless"):
+            keyless_text = f"keyless={'on' if provider.get('keyless_public_enabled') else 'off'} "
         lines.append(
             f"- {provider['provider']}: env={provider['env_var']} "
             f"key={'yes' if provider['key_present'] else 'no'} "
+            f"{keyless_text}"
             f"capabilities={','.join(capabilities)} "
             f"auto_allowed={'yes' if provider['auto_allowed'] else 'no'} "
             f"disabled={'yes' if provider['disabled'] else 'no'} "
@@ -605,9 +712,6 @@ Intelligent Auto-Routing:
   Discovery Intent → Exa (Neural)
     "similar to", "companies like", "alternatives", URLs, startups, papers
 
-  Direct Answer Intent → Perplexity (via Kilo Gateway)
-    "what is", "current status", local events, synthesized up-to-date answers
-
 Examples:
   python3 search.py -q "iPhone 16 Pro Max price"          # → Serper (shopping)
   python3 search.py -q "how does HTTPS encryption work"   # → Tavily (research)
@@ -622,11 +726,49 @@ Full docs: See README.md and SKILL.md
     parser.add_argument(
         "command",
         nargs="?",
-        choices=["doctor"],
-        help="Run a maintenance command such as 'doctor'",
+        choices=["doctor", "bench", "extract-bench", "state-migrate"],
+        help="Run doctor, benchmark, or reversible state-migration maintenance",
     )
     parser.add_argument("--json", action="store_true", help="Emit JSON for maintenance commands")
     parser.add_argument("--live", action="store_true", help="Allow doctor to run live provider smokes (reserved; offline by default)")
+    parser.add_argument(
+        "--bench",
+        action="store_true",
+        help="Benchmark configured search providers against a fixed live query suite and recommend an auto_routing.provider_priority (alias for the 'bench' command; spends real provider quota)",
+    )
+    parser.add_argument(
+        "--bench-providers",
+        nargs="+",
+        choices=list(EXTRACT_PROVIDER_IDS),
+        help="Limit extract-bench to these direct extraction providers",
+    )
+    parser.add_argument(
+        "--bench-timeout-budget",
+        type=float,
+        default=_extract_bench.DEFAULT_TIMEOUT_BUDGET_SECONDS,
+        help="Best-effort whole-run wall-clock budget for extract-bench",
+    )
+    parser.add_argument(
+        "--no-history",
+        action="store_true",
+        help="Do not persist the completed extract-bench summary for the Operator Console",
+    )
+    migration_action = parser.add_mutually_exclusive_group()
+    migration_action.add_argument(
+        "--apply",
+        action="store_true",
+        help="Apply state-migrate after creating a verified backup (dry-run is default)",
+    )
+    migration_action.add_argument(
+        "--rollback",
+        metavar="BACKUP_ID",
+        help="Rollback state-migrate using a verified backup ID",
+    )
+    parser.add_argument(
+        "--migration-backup-root",
+        type=Path,
+        help="Override the default v3/migration-backups directory",
+    )
 
     # Common arguments
     parser.add_argument(
@@ -653,6 +795,8 @@ Full docs: See README.md and SKILL.md
     parser.add_argument("--extract-images", action="store_true", help="Extract image metadata when supported")
     parser.add_argument("--include-raw-html", action="store_true", help="Include raw HTML when supported")
     parser.add_argument("--render-js", action="store_true", help="Render JavaScript before extraction when supported")
+    parser.add_argument("--spans", action="store_true", help="Select deterministic semantic spans from extracted text")
+    parser.add_argument("--spans-query", help="Query used to rank extracted semantic spans")
     parser.add_argument(
         "--max-results", "-n", 
         type=int, 
@@ -682,10 +826,20 @@ Full docs: See README.md and SKILL.md
         help="Show detailed routing analysis (debug mode)"
     )
     
-    # Serper-specific
+    # Locale (providers with country/language request parameters). Left unset,
+    # search_locale.resolve_locale applies: explicit provider config > query
+    # location hint > defaults.locale > us/en fallback. Explicit flags win.
     serper_config = config.get("serper", {})
-    parser.add_argument("--country", default=serper_config.get("country", "us"))
-    parser.add_argument("--language", default=serper_config.get("language", "en"))
+    parser.add_argument(
+        "--country",
+        default=None,
+        help="ISO 3166-1 alpha-2 country override (e.g. at, fr); beats config defaults and query location hints"
+    )
+    parser.add_argument(
+        "--language",
+        default=None,
+        help="ISO 639-1 language override (e.g. de); beats config defaults and query language inference"
+    )
     parser.add_argument(
         "--type", 
         dest="search_type", 
@@ -693,8 +847,33 @@ Full docs: See README.md and SKILL.md
         choices=["search", "news", "images", "videos", "places", "shopping"]
     )
     parser.add_argument(
-        "--time-range", 
+        "--search-type",
+        dest="search_type",
+        type=str.lower,
+        choices=list(_providers.SEARCH_TYPE_VALUES),
+        # Shares dest with the legacy serper-only --type flag above; SUPPRESS
+        # keeps --type's config-driven default when neither flag is passed.
+        default=argparse.SUPPRESS,
+        help=(
+            "Unified result vertical (search or news; case-insensitive). Providers with a "
+            "native news vertical (currently serper) serve it directly; all other providers "
+            "run the normal search and result metadata reports search_type.applied=false"
+        )
+    )
+    parser.add_argument(
+        "--time-range",
         choices=["hour", "day", "week", "month", "year"]
+    )
+    parser.add_argument(
+        "--freshness",
+        type=str.lower,
+        choices=list(_providers.FRESHNESS_VALUES),
+        help=(
+            "Unified recency filter (day, week, month, year; case-insensitive). "
+            "Applied natively where the provider supports it (serper, brave, querit, firecrawl, "
+            "keenable, you, and searxng); otherwise the search runs "
+            "unfiltered and result metadata reports freshness.applied=false"
+        )
     )
     
     # Tavily-specific
@@ -735,8 +914,8 @@ Full docs: See README.md and SKILL.md
     parser.add_argument(
         "--linkup-output-type",
         default=linkup_config.get("output_type", "searchResults"),
-        choices=["searchResults", "sourcedAnswer"],
-        help="Linkup output type"
+        choices=["searchResults"],
+        help="Linkup source-results output (fixed by the source-only charter)"
     )
 
     # Exa-specific
@@ -750,8 +929,8 @@ Full docs: See README.md and SKILL.md
     parser.add_argument(
         "--exa-depth",
         default=exa_config.get("depth", "normal"),
-        choices=["normal", "deep", "deep-reasoning"],
-        help="Exa search depth: deep (synthesized, 4-12s), deep-reasoning (cross-reference, 12-50s)"
+        choices=["normal"],
+        help="Exa source-result depth (fixed to normal by the source-only charter)"
     )
     parser.add_argument(
         "--exa-verbosity",
@@ -794,11 +973,6 @@ Full docs: See README.md and SKILL.md
         help="You.com SafeSearch filter"
     )
     parser.add_argument(
-        "--freshness",
-        choices=["day", "week", "month", "year"],
-        help="Filter results by recency (You.com/Serper)"
-    )
-    parser.add_argument(
         "--livecrawl",
         choices=["web", "news", "all"],
         help="You.com: fetch full page content"
@@ -813,7 +987,7 @@ Full docs: See README.md and SKILL.md
     searxng_config = config.get("searxng", {})
     parser.add_argument(
         "--searxng-url",
-        default=searxng_config.get("instance_url"),
+        default=searxng_config.get("base_url") or searxng_config.get("instance_url"),
         help="SearXNG instance URL (e.g., https://searx.example.com)"
     )
     parser.add_argument(
@@ -901,6 +1075,33 @@ def main():
     parser = build_parser(config)
     args = parser.parse_args()
 
+    migration_options_used = bool(
+        args.apply or args.rollback or args.migration_backup_root is not None
+    )
+    if args.command != "state-migrate" and migration_options_used:
+        parser.error("--apply, --rollback, and --migration-backup-root require state-migrate")
+
+    if args.command == "state-migrate":
+        state_path = CACHE_DIR / "v3" / "state.sqlite3"
+        backup_root = args.migration_backup_root or state_path.parent / "migration-backups"
+        if args.rollback:
+            report = _state_migration.rollback_legacy_state(
+                state_path=state_path,
+                backup_root=backup_root,
+                backup_id=args.rollback,
+            )
+        else:
+            report = _state_migration.migrate_legacy_state(
+                cache_root=CACHE_DIR,
+                state_path=state_path,
+                backup_root=backup_root,
+                dry_run=not args.apply,
+            )
+        print(_state_migration.render_migration_report(report))
+        if report.status not in {"ready", "applied", "unchanged", "rolled_back"}:
+            raise SystemExit(2)
+        return
+
     if args.command == "doctor":
         report = _build_doctor_report(config, live=args.live)
         if args.json or args.compact:
@@ -909,7 +1110,39 @@ def main():
         else:
             print(_format_doctor_text(report))
         return
-    
+
+    if args.command == "bench" or args.bench:
+        report = run_provider_bench(config, max_results=args.max_results)
+        if args.json or args.compact:
+            indent = None if args.compact else 2
+            print(json.dumps(report, indent=indent, ensure_ascii=False))
+        else:
+            print(format_bench_text(report))
+        return
+
+    if args.command == "extract-bench":
+        if not args.extract_urls:
+            parser.error("extract-bench requires one or more --extract-urls")
+        report = _extract_bench.run_extract_bench(
+            config,
+            urls=args.extract_urls,
+            providers=args.bench_providers,
+            timeout_budget=args.bench_timeout_budget,
+        )
+        if not args.no_history:
+            report["history_written"] = _extract_bench.BenchmarkHistoryJournal(
+                CACHE_DIR
+            ).append(_extract_bench.benchmark_history_record(report))
+        else:
+            report["history_written"] = False
+        if args.json or args.compact:
+            indent = None if args.compact else 2
+            print(json.dumps(report, indent=indent, ensure_ascii=False))
+        else:
+            print(_extract_bench.format_extract_bench_text(report))
+            print("History written: {}".format(report["history_written"]))
+        return
+
     # Handle cache management commands first (before query validation)
     if args.clear_cache:
         result = cache_clear()
@@ -931,6 +1164,8 @@ def main():
             include_images=args.extract_images,
             include_raw_html=args.include_raw_html,
             render_js=args.render_js,
+            spans=args.spans,
+            spans_query=args.spans_query,
             config=config,
         )
         indent = None if args.compact else 2
@@ -949,7 +1184,7 @@ def main():
         print(json.dumps(explanation, indent=indent, ensure_ascii=False))
         return
 
-    payload, exit_code = execute_search_request(args, config)
+    payload, exit_code = _execute_search_request_core(args, config)
     if exit_code == 0:
         indent = None if args.compact else 2
         print(json.dumps(payload, indent=indent, ensure_ascii=False))
@@ -1006,7 +1241,163 @@ def _apply_result_quality_pipeline(
             result.setdefault("metadata", {})["domain_diversity_demoted"] = demoted
 
 
-def execute_search_request(args, config: Dict[str, Any]) -> Tuple[Dict[str, Any], int]:
+def _legacy_search_cache_context(
+    args, provider: str, config: Dict[str, Any]
+) -> Dict[str, Any]:
+    locale_country, locale_language, _locale_meta = resolve_locale(
+        provider,
+        config,
+        args.query,
+        cli_country=args.country,
+        cli_language=args.language,
+    )
+    return {
+        "locale": f"{locale_country}:{locale_language}",
+        "freshness": args.freshness,
+        "time_range": args.time_range,
+        "include_domains": sorted(args.include_domains)
+        if args.include_domains
+        else None,
+        "exclude_domains": sorted(args.exclude_domains)
+        if args.exclude_domains
+        else None,
+        "topic": args.topic,
+        "search_engines": sorted(args.engines) if args.engines else None,
+        "include_news": not args.no_news,
+        "search_type": args.search_type,
+        "exa_type": args.exa_type,
+        "exa_depth": args.exa_depth,
+        "exa_verbosity": args.exa_verbosity,
+        "category": args.category,
+        "similar_url": args.similar_url,
+        "mode": args.mode,
+        "quality_report": args.quality_report,
+    }
+
+
+def _diversity_settings(config: Dict[str, Any]) -> Tuple[bool, float]:
+    """Read the validated diversity settings with safe direct-call fallbacks."""
+    quality_config = config.get("quality") if isinstance(config.get("quality"), dict) else {}
+    diversity_config = (
+        quality_config.get("diversity")
+        if isinstance(quality_config.get("diversity"), dict)
+        else {}
+    )
+    rerank = diversity_config.get("rerank") is True
+    threshold = diversity_config.get(
+        "near_duplicate_threshold", DEFAULT_NEAR_DUPLICATE_THRESHOLD
+    )
+    if isinstance(threshold, bool):
+        threshold = DEFAULT_NEAR_DUPLICATE_THRESHOLD
+    try:
+        threshold = float(threshold)
+    except (TypeError, ValueError):
+        threshold = DEFAULT_NEAR_DUPLICATE_THRESHOLD
+    if threshold < 0.0 or threshold > 1.0:
+        threshold = DEFAULT_NEAR_DUPLICATE_THRESHOLD
+    return rerank, threshold
+
+
+def _research_quorum_settings(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Read validated Research early-return controls for direct callers too."""
+    raw_quality_config = config.get("quality")
+    quality_config = raw_quality_config if isinstance(raw_quality_config, dict) else {}
+    configured = quality_config.get("research_quorum")
+    configured = configured if isinstance(configured, dict) else {}
+    defaults = {
+        "enabled": True,
+        "min_contributing_providers": 2,
+        "result_target_cap": 5,
+        "min_unique_domains": 3,
+    }
+    settings = {**defaults, **configured}
+    # Validation owns persisted config; conservative fallbacks keep callers that
+    # invoke the public search helpers with hand-built config dicts safe.
+    if settings["enabled"] is not True:
+        settings["enabled"] = False
+    for name, minimum in (
+        ("min_contributing_providers", 2),
+        ("result_target_cap", 1),
+        ("min_unique_domains", 1),
+    ):
+        value = settings[name]
+        if isinstance(value, bool):
+            settings[name] = defaults[name]
+            continue
+        try:
+            settings[name] = max(minimum, int(value))
+        except (TypeError, ValueError):
+            settings[name] = defaults[name]
+    return settings
+
+
+def _finalize_research_result(
+    result: Dict[str, Any],
+    *,
+    args,
+    config: Dict[str, Any],
+    routing_info: Dict[str, Any],
+    providers_considered: List[str],
+    research_providers: List[str],
+    cooldown_skips: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Apply the shared public Research Mode metadata and quality envelope."""
+    final_routing = dict(routing_info)
+    final_routing["mode"] = "research"
+    final_routing["provider"] = "research"
+    result.setdefault("routing", {}).update(final_routing)
+    if cooldown_skips:
+        result["routing"]["providers_skipped"] = [
+            {
+                "provider": item.get("provider"),
+                "reason": "cooldown",
+                "cooldown_remaining_seconds": item.get(
+                    "cooldown_remaining_seconds"
+                ),
+            }
+            for item in cooldown_skips
+        ]
+    if args.freshness:
+        result.setdefault("metadata", {})["freshness"] = {
+            "requested": args.freshness,
+            "providers": [
+                _providers.freshness_metadata(provider, args.freshness)
+                for provider in research_providers
+            ],
+        }
+    research_search_type = getattr(args, "search_type", None)
+    if (
+        research_search_type in _providers.SEARCH_TYPE_VALUES
+        and research_search_type != "search"
+    ):
+        result.setdefault("metadata", {})["search_type"] = {
+            "requested": research_search_type,
+            "providers": [
+                _providers.search_type_metadata(provider, research_search_type)
+                for provider in research_providers
+            ],
+        }
+    _apply_result_quality_pipeline(
+        result,
+        config,
+        query=args.query or "",
+        include_domains=args.include_domains,
+    )
+    _diversity_rerank, near_duplicate_threshold = _diversity_settings(config)
+    result["quality_report"] = build_quality_report(
+        query=args.query,
+        result=result,
+        routing_info=final_routing,
+        providers_considered=providers_considered,
+        eligible_providers=research_providers,
+        cooldown_skips=cooldown_skips,
+        errors=result.get("routing", {}).get("provider_errors", []),
+        near_duplicate_threshold=near_duplicate_threshold,
+    )
+    return result
+
+
+def _execute_search_request_core(args, config: Dict[str, Any]) -> Tuple[Dict[str, Any], int]:
     """Run the search/research pipeline for parsed args.
 
     Returns ``(payload, exit_code)`` where exit_code 0 means a success payload bound
@@ -1014,10 +1405,21 @@ def execute_search_request(args, config: Dict[str, Any]) -> Tuple[Dict[str, Any]
     prints or calls ``sys.exit`` so the Hermes plugin can invoke it in-process
     instead of spawning a subprocess.
     """
+    config = apply_profile_effects(config)
+
     # Determine provider
     if args.provider == "auto" or (args.provider is None and not args.similar_url):
         if args.query:
             routing = auto_route_provider(args.query, config)
+            if routing.get("error_type"):
+                return {
+                    "error": routing["error"],
+                    "error_type": routing["error_type"],
+                    "provider": "auto",
+                    "query": args.query,
+                    "results": [],
+                    "metadata": {"profile": config.get("profile")},
+                }, 1
             provider = routing["provider"]
             routing_info = {
                 "auto_routed": True,
@@ -1044,6 +1446,11 @@ def execute_search_request(args, config: Dict[str, Any]) -> Tuple[Dict[str, Any]
     else:
         provider = args.provider or "serper"
         routing_info = {"auto_routed": False, "provider": provider, "routing_policy": ROUTING_POLICY}
+    profile_deviation = (
+        is_self_hosted_profile(config)
+        and args.provider not in (None, "auto")
+        and provider not in SELF_HOSTED_SEARCH_PROVIDER_IDS
+    )
     
     # Build provider fallback list
     auto_config = config.get("auto_routing", {})
@@ -1067,199 +1474,53 @@ def execute_search_request(args, config: Dict[str, Any]) -> Tuple[Dict[str, Any]
     providers_to_try = [provider] if provider else []
     if not strict_provider_mode:
         for p in provider_priority:
-            if p not in providers_to_try and p not in disabled_providers and _provider_auto_allowed(p, auto_config) and get_api_key(p, config):
+            if p not in providers_to_try and p not in disabled_providers and _provider_auto_allowed(p, auto_config) and provider_configured(p, config):
                 providers_to_try.append(p)
 
-    # Skip providers currently in cooldown
+    # The v3 AttemptEngine owns admission/circuit state. Its single-provider
+    # adapter must not consult or mutate the legacy provider-health system.
+    engine_owned_attempt = bool(getattr(args, "_v3_engine_owned_attempt", False))
     eligible_providers = []
     cooldown_skips = []
-    for p in providers_to_try:
-        in_cd, remaining = provider_in_cooldown(p)
-        if in_cd:
-            cooldown_skips.append({"provider": p, "cooldown_remaining_seconds": remaining})
-        else:
-            eligible_providers.append(p)
+    if engine_owned_attempt:
+        eligible_providers = list(providers_to_try)
+    else:
+        for p in providers_to_try:
+            in_cd, remaining = provider_in_cooldown(p)
+            if in_cd:
+                cooldown_skips.append({"provider": p, "cooldown_remaining_seconds": remaining})
+            else:
+                eligible_providers.append(p)
 
     if not eligible_providers:
         eligible_providers = providers_to_try[:1]
 
-    # Helper function to execute search for a provider
+    # Helper function to execute search for a provider. Provider-specific
+    # kwargs-building lives in provider_dispatch.SEARCH_DISPATCH; the caller
+    # namespace (globals()) is passed so adapters resolve search_<provider>
+    # late and honour monkeypatches on this module (search.search_you etc.).
     def execute_search(prov: str) -> Dict[str, Any]:
+        validate_provider_mode(prov, "search")
         key = validate_api_key(prov, config)
-        if prov == "serper":
-            return search_serper(
-                query=args.query,
-                api_key=key,
-                max_results=args.max_results,
-                country=args.country,
-                language=args.language,
-                search_type=args.search_type,
-                time_range=args.time_range,
-                include_images=args.images,
-            )
-        elif prov == "serpbase":
-            serpbase_config = config.get("serpbase", {})
-            return search_serpbase(
-                query=args.query,
-                api_key=key,
-                max_results=args.max_results,
-                country=serpbase_config.get("country", args.country),
-                language=serpbase_config.get("language", args.language),
-                page=int(serpbase_config.get("page", 1)),
-                api_url=serpbase_config.get("api_url", "https://api.serpbase.dev/google/search"),
-                timeout=int(serpbase_config.get("timeout", 30)),
-            )
-        elif prov == "brave":
-            brave_config = config.get("brave", {})
-            return search_brave(
-                query=args.query,
-                api_key=key,
-                max_results=args.max_results,
-                country=brave_config.get("country", args.country),
-                language=brave_config.get("search_lang", args.language),
-                time_range=args.time_range or args.freshness,
-                safesearch=brave_config.get("safesearch", "moderate"),
-            )
-        elif prov == "tavily":
-            return search_tavily(
-                query=args.query,
-                api_key=key,
-                max_results=args.max_results,
-                depth=args.depth,
-                topic=args.topic,
-                include_domains=args.include_domains,
-                exclude_domains=args.exclude_domains,
-                include_images=args.images,
-                include_raw_content=args.raw_content,
-            )
-        elif prov == "linkup":
-            linkup_config = config.get("linkup", {})
-            return search_linkup(
-                query=args.query,
-                api_key=key,
-                max_results=args.max_results,
-                depth=args.linkup_depth,
-                output_type=args.linkup_output_type,
-                include_domains=args.include_domains,
-                exclude_domains=args.exclude_domains,
-                api_url=linkup_config.get("api_url", "https://api.linkup.so/v1/search"),
-                timeout=int(linkup_config.get("timeout", 30)),
-            )
-        elif prov == "querit":
-            querit_config = config.get("querit", {})
-            return search_querit(
-                query=args.query,
-                api_key=key,
-                max_results=args.max_results,
-                language=args.language,
-                country=args.country,
-                time_range=args.time_range or args.freshness,
-                include_domains=args.include_domains,
-                exclude_domains=args.exclude_domains,
-                base_url=args.querit_base_url,
-                base_path=args.querit_base_path,
-                timeout=int(querit_config.get("timeout", 30)),
-            )
-        elif prov == "exa":
-            # CLI --exa-depth overrides; fallback to auto-routing suggestion
-            exa_depth = args.exa_depth
-            if exa_depth == "normal" and routing_info.get("exa_depth") in ("deep", "deep-reasoning"):
-                exa_depth = routing_info["exa_depth"]
-            return search_exa(
-                query=args.query or "",
-                api_key=key,
-                max_results=args.max_results,
-                search_type=args.exa_type,
-                exa_depth=exa_depth,
-                category=args.category,
-                start_date=args.start_date,
-                end_date=args.end_date,
-                similar_url=args.similar_url,
-                include_domains=args.include_domains,
-                exclude_domains=args.exclude_domains,
-                text_verbosity=args.exa_verbosity,
-            )
-        elif prov == "firecrawl":
-            firecrawl_config = config.get("firecrawl", {})
-            return search_firecrawl(
-                query=args.query,
-                api_key=key,
-                max_results=args.max_results,
-                country=firecrawl_config.get("country", args.country),
-                time_range=args.time_range or args.freshness,
-                sources=args.firecrawl_sources,
-                include_domains=args.include_domains,
-                exclude_domains=args.exclude_domains,
-                scrape_markdown=args.firecrawl_scrape or args.raw_content,
-                ignore_invalid_urls=firecrawl_config.get("ignore_invalid_urls", False),
-                api_url=firecrawl_config.get("api_url", "https://api.firecrawl.dev/v2/search"),
-                timeout_ms=int(firecrawl_config.get("timeout", 30000)),
-            )
-        elif prov == "parallel":
-            parallel_config = config.get("parallel", {})
-            return search_parallel(
-                query=args.query,
-                api_key=key,
-                max_results=args.max_results,
-                include_domains=args.include_domains,
-                exclude_domains=args.exclude_domains,
-                api_url=parallel_config.get("api_url", "https://api.parallel.ai/v1/search"),
-                timeout=int(parallel_config.get("timeout", 45)),
-                client_model=parallel_config.get("client_model"),
-            )
-        elif prov in {"perplexity", "kilo-perplexity"}:
-            perplexity_config = config.get(prov, {})
-            defaults = DEFAULT_CONFIG.get(prov, {})
-            return search_perplexity(
-                query=args.query,
-                api_key=key,
-                max_results=args.max_results,
-                model=perplexity_config.get("model", defaults.get("model", "sonar-pro")),
-                api_url=perplexity_config.get("api_url", defaults.get("api_url", "https://api.perplexity.ai/chat/completions")),
-                freshness=getattr(args, "freshness", None),
-                provider_name=prov,
-            )
-        elif prov == "you":
-            return search_you(
-                query=args.query,
-                api_key=key,
-                max_results=args.max_results,
-                country=args.country,
-                language=args.language,
-                freshness=args.freshness,
-                safesearch=args.you_safesearch,
-                include_news=not args.no_news,
-                livecrawl=args.livecrawl,
-            )
-        elif prov == "searxng":
-            # For SearXNG, 'key' is actually the instance URL
-            instance_url = args.searxng_url or key
-            if instance_url:
-                instance_url = _validate_searxng_url(instance_url)
-            return search_searxng(
-                query=args.query,
-                instance_url=instance_url,
-                max_results=args.max_results,
-                categories=args.categories,
-                engines=args.engines,
-                language=args.language,
-                time_range=args.time_range,
-                safesearch=args.searxng_safesearch,
-            )
-        elif prov == "anysearch":
-            anysearch_config = config.get("anysearch", {})
-            return search_anysearch(
-                query=args.query,
-                api_key=key,
-                max_results=args.max_results,
-                zone=anysearch_config.get("zone", "intl"),
-                language=anysearch_config.get("language", args.language),
-                time_range=args.time_range or args.freshness,
-            )
-        else:
+        adapter = SEARCH_DISPATCH.get(prov)
+        if adapter is None:
             raise ValueError(f"Unknown provider: {prov}")
+        provider_result = validate_adapter_result(
+            prov,
+            "search",
+            adapter(globals(), prov, args, key, config, routing_info),
+        )
+        if engine_owned_attempt:
+            provider_result["_v3_raw_results"] = [
+                dict(item)
+                for item in (provider_result.get("results") or [])
+                if isinstance(item, dict)
+            ]
+        return provider_result
 
     def execute_with_retry(prov: str) -> Dict[str, Any]:
+        if engine_owned_attempt:
+            return execute_search(prov)
         started = time.monotonic()
         try:
             provider_result = execute_provider_with_retry(prov, lambda: execute_search(prov))
@@ -1276,39 +1537,38 @@ def execute_search_request(args, config: Dict[str, Any]) -> Tuple[Dict[str, Any]
         )
         return provider_result
 
-    cache_context = {
-        "locale": f"{args.country}:{args.language}",
-        "freshness": args.freshness,
-        "time_range": args.time_range,
-        "include_domains": sorted(args.include_domains) if args.include_domains else None,
-        "exclude_domains": sorted(args.exclude_domains) if args.exclude_domains else None,
-        "topic": args.topic,
-        "search_engines": sorted(args.engines) if args.engines else None,
-        "include_news": not args.no_news,
-        "search_type": args.search_type,
-        "exa_type": args.exa_type,
-        "exa_depth": args.exa_depth,
-        "exa_verbosity": args.exa_verbosity,
-        "category": args.category,
-        "similar_url": args.similar_url,
-        "mode": args.mode,
-        "quality_report": args.quality_report,
-    }
+    cache_context = _legacy_search_cache_context(args, provider or "", config)
 
     providers_considered = providers_to_try.copy()
 
     if args.mode == "research":
         available_research_providers = {
             p for p in providers_to_try
-            if p not in disabled_providers and _provider_auto_allowed(p, auto_config) and get_api_key(p, config) and not provider_in_cooldown(p)[0]
+            if p not in disabled_providers and _provider_auto_allowed(p, auto_config) and provider_configured(p, config) and not provider_in_cooldown(p)[0]
         }
-        if provider and get_api_key(provider, config) and not provider_in_cooldown(provider)[0]:
+        if provider and provider_configured(provider, config) and not provider_in_cooldown(provider)[0]:
             available_research_providers.add(provider)
         if args.research_providers:
-            research_providers = [
-                p for p in args.research_providers
-                if p not in disabled_providers and _provider_auto_allowed(p, auto_config) and get_api_key(p, config) and not provider_in_cooldown(p)[0]
-            ]
+            # Explicit research selection follows the same contract as an
+            # explicit single-provider call: auto-routing allowlists do not
+            # veto the caller's named provider. Disabled/unconfigured providers
+            # remain unavailable, and cooldown skips stay visible in receipts.
+            research_providers = []
+            for p in args.research_providers:
+                if p in disabled_providers or not provider_configured(p, config):
+                    continue
+                in_cooldown, remaining = provider_in_cooldown(p)
+                if in_cooldown:
+                    if not any(item.get("provider") == p for item in cooldown_skips):
+                        cooldown_skips.append(
+                            {
+                                "provider": p,
+                                "cooldown_remaining_seconds": remaining,
+                            }
+                        )
+                    continue
+                if p not in research_providers:
+                    research_providers.append(p)
         else:
             research_providers = select_research_providers(
                 primary_provider=provider,
@@ -1327,6 +1587,8 @@ def execute_search_request(args, config: Dict[str, Any]) -> Tuple[Dict[str, Any]
             }
             return error_result, 1
 
+        diversity_rerank, near_duplicate_threshold = _diversity_settings(config)
+        quorum_settings = _research_quorum_settings(config)
         result = run_research_mode(
             query=args.query,
             research_providers=research_providers,
@@ -1340,19 +1602,23 @@ def execute_search_request(args, config: Dict[str, Any]) -> Tuple[Dict[str, Any]
             max_results=args.max_results,
             max_extract_urls=args.research_extract_count,
             time_budget_seconds=args.research_time_budget,
+            diversity_rerank=diversity_rerank,
+            near_duplicate_threshold=near_duplicate_threshold,
+            quorum_enabled=quorum_settings["enabled"],
+            quorum_min_contributing_providers=quorum_settings[
+                "min_contributing_providers"
+            ],
+            quorum_result_target_cap=quorum_settings["result_target_cap"],
+            quorum_min_unique_domains=quorum_settings["min_unique_domains"],
         )
-        routing_info["mode"] = "research"
-        routing_info["provider"] = "research"
-        result["routing"].update(routing_info)
-        _apply_result_quality_pipeline(result, config, query=args.query or "", include_domains=args.include_domains)
-        result["quality_report"] = build_quality_report(
-            query=args.query,
-            result=result,
+        result = _finalize_research_result(
+            result,
+            args=args,
+            config=config,
             routing_info=routing_info,
             providers_considered=providers_considered,
-            eligible_providers=research_providers,
+            research_providers=research_providers,
             cooldown_skips=cooldown_skips,
-            errors=result.get("routing", {}).get("provider_errors", []),
         )
         return result, 0
 
@@ -1384,7 +1650,8 @@ def execute_search_request(args, config: Dict[str, Any]) -> Tuple[Dict[str, Any]
             break
         try:
             provider_result = execute_with_retry(current_provider)
-            reset_provider_health(current_provider)
+            if not engine_owned_attempt:
+                reset_provider_health(current_provider)
             successful_results.append((current_provider, provider_result))
             successful_provider = current_provider
 
@@ -1395,7 +1662,20 @@ def execute_search_request(args, config: Dict[str, Any]) -> Tuple[Dict[str, Any]
             # Only continue collecting from lower-priority providers when fallback was needed.
             if not errors:
                 break
+        except ProviderConfigError as e:
+            if engine_owned_attempt:
+                raise
+            # Missing/invalid local credentials are configuration errors, not
+            # provider health failures. Do not poison shared cooldown state for
+            # a provider the runtime never actually contacted.
+            errors.append({
+                "provider": current_provider,
+                "error": str(e),
+            })
+            continue
         except Exception as e:
+            if engine_owned_attempt:
+                raise
             error_msg = str(e)
             cooldown_info = mark_provider_failure(current_provider, error_msg, retry_after=getattr(e, "retry_after", None))
             errors.append({
@@ -1428,6 +1708,8 @@ def execute_search_request(args, config: Dict[str, Any]) -> Tuple[Dict[str, Any]
             result = primary
 
     if result is not None:
+        if engine_owned_attempt and getattr(args, "_v3_research_member", False):
+            return result, 0
         if successful_provider != provider:
             routing_info["fallback_used"] = True
             routing_info["original_provider"] = provider
@@ -1447,7 +1729,37 @@ def execute_search_request(args, config: Dict[str, Any]) -> Tuple[Dict[str, Any]
 
         result["routing"] = routing_info
 
-        if not cache_hit and not args.no_cache and args.query:
+        if args.freshness:
+            result.setdefault("metadata", {})["freshness"] = _providers.freshness_metadata(
+                successful_provider or provider, args.freshness
+            )
+
+        requested_search_type = getattr(args, "search_type", None)
+        if requested_search_type in _providers.SEARCH_TYPE_VALUES and requested_search_type != "search":
+            result.setdefault("metadata", {})["search_type"] = _providers.search_type_metadata(
+                successful_provider or provider, requested_search_type
+            )
+
+        # Locale transparency (freshness-metadata pattern): report the
+        # resolved country/language and where each came from, but only for
+        # providers whose request actually carries locale parameters.
+        final_provider = successful_provider or provider
+        if provider_supports_locale(final_provider):
+            _, _, locale_meta = resolve_locale(
+                final_provider, config, args.query,
+                cli_country=args.country, cli_language=args.language,
+            )
+            result.setdefault("metadata", {})["locale"] = locale_meta
+
+        if profile_deviation:
+            result.setdefault("metadata", {})["profile_deviation"] = True
+
+        if (
+            not cache_hit
+            and not args.no_cache
+            and args.query
+            and not getattr(args, "_v3_no_legacy_cache_write", False)
+        ):
             cache_put(
                 query=args.query,
                 provider=successful_provider or provider,
@@ -1463,6 +1775,7 @@ def execute_search_request(args, config: Dict[str, Any]) -> Tuple[Dict[str, Any]
             result["metadata"].setdefault("dedup_count", 0)
 
         if args.quality_report:
+            _diversity_rerank, near_duplicate_threshold = _diversity_settings(config)
             result["quality_report"] = build_quality_report(
                 query=args.query,
                 result=result,
@@ -1471,6 +1784,7 @@ def execute_search_request(args, config: Dict[str, Any]) -> Tuple[Dict[str, Any]
                 eligible_providers=eligible_providers,
                 cooldown_skips=cooldown_skips,
                 errors=errors,
+                near_duplicate_threshold=near_duplicate_threshold,
             )
 
         return result, 0
@@ -1486,6 +1800,508 @@ def execute_search_request(args, config: Dict[str, Any]) -> Tuple[Dict[str, Any]
         return error_result, 1
 
 
+def execute_search_request(args, config: Dict[str, Any]) -> Tuple[Dict[str, Any], int]:
+    """Backward-compatible standalone CLI seam over the unchanged provider core."""
+    return _execute_search_request_core(args, config)
+
+
+def _plan_search_v3(request: RequestV3, config: Dict[str, Any]) -> ProviderPlan:
+    config = apply_profile_effects(config)
+    routing_request = request.routing
+    requested = str(routing_request.get("provider") or "auto")
+    auto_config = config.get("auto_routing", {})
+    if requested == "auto":
+        routed = auto_route_provider(request.input["query"], config)
+        if routed.get("error_type"):
+            # ProviderPlan is intentionally non-empty even for a local
+            # preflight error; execution returns before this placeholder can
+            # be contacted.
+            return ProviderPlan(("keenable",), "keenable", routing_metadata=dict(routed))
+        selected = str(routed["provider"])
+    else:
+        selected = requested
+        routed = {}
+    candidates = [selected]
+    disabled = set(auto_config.get("disabled_providers", []))
+    research_mode = str(request.options.get("mode") or "normal") == "research"
+    fixed_provider_mode = (
+        requested == "auto" and auto_config.get("enabled", True) is False
+    )
+    expand_candidates = routing_request.get("allow_fallback", requested == "auto")
+    if not fixed_provider_mode and (
+        (research_mode and requested == "auto") or expand_candidates
+    ):
+        for provider in auto_config.get("provider_priority", list(SEARCH_PROVIDER_IDS)):
+            if (
+                provider not in candidates
+                and provider not in disabled
+                and _provider_auto_allowed(provider, auto_config)
+                and provider_configured(provider, config)
+            ):
+                candidates.append(provider)
+    if research_mode:
+        # Research is a bounded fan-out, not a fallback chain. Use the same
+        # diversity-biased provider selection as the standalone research path,
+        # constrained to the v3 planner's eligible candidates.
+        candidates = select_research_providers(
+            primary_provider=selected,
+            provider_priority=list(
+                auto_config.get("provider_priority", list(SEARCH_PROVIDER_IDS))
+            ),
+            available_providers=set(candidates),
+            max_providers=3,
+        )
+    return ProviderPlan(tuple(candidates), selected, routing_metadata=dict(routed))
+
+
+def _daily_preflight_budget(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the optional global provider-call ledger settings for attempts."""
+    raw_off = os.environ.get("WSP_BUDGET_PREFLIGHT_OFF")
+    if raw_off is not None and raw_off.strip().strip('"').strip("'").lower() not in {
+        "", "0", "false", "no", "off",
+    }:
+        return {}
+    section = config.get("budget_preflight") or {}
+    limit = section.get("max_daily_provider_calls") if isinstance(section, dict) else None
+    if section.get("enabled") is not True or isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+        return {}
+    return {
+        "daily_budget_scope": "daily_provider_calls",
+        "daily_budget_window": time.strftime("%Y-%m-%d", time.gmtime()),
+        "daily_budget_limit_units": limit,
+    }
+
+
+def _search_args_from_v3(request: RequestV3, config: Dict[str, Any]):
+    options = request.options
+    routing_request = request.routing
+    argv: List[str] = [
+        "--query", request.input["query"],
+        "--provider", str(routing_request.get("provider") or "auto"),
+        "--max-results", str(options.get("max_results", 5)),
+    ]
+    if options.get("depth", "normal") != "normal":
+        argv += ["--exa-depth", str(options["depth"])]
+    if options.get("time_range"):
+        argv += ["--time-range", str(options["time_range"])]
+    if options.get("freshness"):
+        argv += ["--freshness", str(options["freshness"])]
+    if options.get("search_type"):
+        argv += ["--search-type", str(options["search_type"])]
+    if options.get("include_domains"):
+        argv += ["--include-domains", *options["include_domains"]]
+    if options.get("exclude_domains"):
+        argv += ["--exclude-domains", *options["exclude_domains"]]
+    if options.get("mode", "normal") != "normal":
+        argv += ["--mode", str(options["mode"]), "--research-time-budget", str(options.get("research_time_budget", 55.0))]
+    if options.get("quality_report"):
+        argv += ["--quality-report"]
+    locale = options.get("locale") or {}
+    if locale.get("language"):
+        argv += ["--language", str(locale["language"])]
+    if locale.get("country"):
+        argv += ["--country", str(locale["country"])]
+    if routing_request.get("allow_fallback") and routing_request.get("mode") == "fixed":
+        argv += ["--allow-fallback"]
+    if request.cache.get("mode") == "bypass":
+        argv += ["--no-cache"]
+    if "ttl_seconds" in request.cache:
+        argv += ["--cache-ttl", str(request.cache["ttl_seconds"])]
+    args = build_parser(config).parse_args(argv)
+    args._v3_no_legacy_cache_write = True
+    return args
+
+
+def _lookup_legacy_search_v3(
+    request: RequestV3, plan: ProviderPlan, config: Dict[str, Any]
+) -> CapabilityExecution | None:
+    legacy_args = _search_args_from_v3(request, config)
+    legacy_args.provider = plan.selected_provider
+    if legacy_args.mode == "research":
+        return None
+    legacy_lookup = peek_legacy_search(
+        CACHE_DIR,
+        query=legacy_args.query,
+        provider=plan.selected_provider,
+        max_results=legacy_args.max_results,
+        params=_legacy_search_cache_context(
+            legacy_args, plan.selected_provider, config
+        ),
+        ttl_seconds=int(request.cache.get("ttl_seconds", 3600)),
+        now=int(time.time()),
+    )
+    if legacy_lookup.legacy_payload is None:
+        return None
+    return CapabilityExecution(
+        payload=legacy_lookup.legacy_payload,
+        provider_attempts=(),
+        stages=("dedup_fingerprint",),
+    )
+
+
+def _execute_research_v3(
+    request: RequestV3, plan: ProviderPlan, config: Dict[str, Any]
+) -> CapabilityExecution:
+    """Execute the planned research fan-out through authoritative v3 attempts."""
+    v3_config = config.get("v3") or {}
+    state_path = v3_config.get("state_path") or os.path.join(
+        str(CACHE_DIR), "v3", "state.sqlite3"
+    )
+    store = SQLiteStateStore(state_path)
+    budget_limit = int(
+        request.budget.get(
+            "max_provider_attempts",
+            v3_config.get("default_max_provider_attempts", 3),
+        )
+    )
+    # Research already gets resilience from independent provider fan-out. A
+    # single try per member prevents an overdue daemon task from starting a new
+    # billable retry after the caller's research deadline has elapsed.
+    engine = AttemptEngine(store, max_attempts=1)
+    providers = list(plan.candidate_order)
+    scope = request.request_id or plan.execution_id
+    contexts = {}
+    receipts_by_provider = {}
+    payloads_by_provider: Dict[str, Dict[str, Any]] = {}
+    operation_started: Dict[str, Tuple[float, float]] = {}
+    timed_out_providers: set[str] = set()
+    daily_budget = _daily_preflight_budget(config)
+
+    for provider in providers:
+        provider_config = config.get(provider) or {}
+        endpoint = str(
+            provider_config.get("endpoint")
+            or provider_config.get("base_url")
+            or provider_config.get("url")
+            or f"provider://{provider}/search"
+        )
+        credential = get_api_key(provider, config) or f"keyless:{provider}"
+        contexts[provider] = AttemptContext(
+            provider=provider,
+            capability=Capability.SEARCH,
+            endpoint=endpoint,
+            credential_fingerprint=store.fingerprint_credential(credential),
+            budget_scope=scope,
+            budget_window="request",
+            budget_limit_units=budget_limit,
+            **daily_budget,
+        )
+
+    def execute_provider(provider: str) -> Dict[str, Any]:
+        def operation() -> Dict[str, Any]:
+            operation_started[provider] = (time.time(), time.monotonic())
+            args = _search_args_from_v3(request, config)
+            args.provider = provider
+            args.mode = "normal"
+            args.research_providers = ""
+            args.allow_fallback = False
+            args.no_cache = True
+            args._v3_engine_owned_attempt = True
+            args._v3_research_member = True
+            provider_payload, exit_code = _execute_search_request_core(args, config)
+            if exit_code:
+                raise ProviderRequestError(
+                    str(provider_payload.get("error") or "provider failed"),
+                    transient=False,
+                )
+            return provider_payload
+
+        attempted = engine.execute(contexts[provider], operation)
+        receipts_by_provider[provider] = attempted.receipt
+        if attempted.payload is None:
+            message = (
+                attempted.receipt.error.message
+                if attempted.receipt.error is not None
+                else "Provider attempt did not return a payload."
+            )
+            raise ProviderRequestError(message)
+        payloads_by_provider[provider] = attempted.payload
+        return attempted.payload
+
+    args = _search_args_from_v3(request, config)
+    time_budget_seconds = float(
+        request.options.get("research_time_budget")
+        or getattr(args, "research_time_budget", 55.0)
+    )
+    max_wall_time_ms = request.budget.get("max_wall_time_ms")
+    if (
+        isinstance(max_wall_time_ms, int)
+        and not isinstance(max_wall_time_ms, bool)
+        and max_wall_time_ms > 0
+    ):
+        time_budget_seconds = min(time_budget_seconds, max_wall_time_ms / 1000)
+    diversity_rerank, near_duplicate_threshold = _diversity_settings(config)
+    quorum_settings = _research_quorum_settings(config)
+    payload = run_research_mode(
+        query=str(request.input.get("query") or ""),
+        research_providers=providers,
+        execute_search=execute_provider,
+        extract_urls=lambda urls: extract_plus(
+            urls=urls,
+            provider="auto",
+            config=config,
+        ),
+        max_results=int(request.options.get("max_results") or 5),
+        max_extract_urls=int(getattr(args, "research_extract_count", 3) or 3),
+        time_budget_seconds=time_budget_seconds,
+        on_provider_timeout=timed_out_providers.add,
+        diversity_rerank=diversity_rerank,
+        near_duplicate_threshold=near_duplicate_threshold,
+        quorum_enabled=quorum_settings["enabled"],
+        quorum_min_contributing_providers=quorum_settings[
+            "min_contributing_providers"
+        ],
+        quorum_result_target_cap=quorum_settings["result_target_cap"],
+        quorum_min_unique_domains=quorum_settings["min_unique_domains"],
+    )
+    extraction_error = str(
+        (payload.get("routing") or {}).get("extraction_error") or ""
+    ).lower()
+    if "research time budget exhausted" in extraction_error:
+        payload["_v3_budget_limited"] = True
+
+    completed_providers = set(
+        (payload.get("routing") or {}).get("providers_queried") or []
+    )
+    receipts = []
+    for provider in providers:
+        receipt = (
+            None
+            if provider in timed_out_providers
+            else receipts_by_provider.get(provider)
+        )
+        if receipt is None:
+            started = operation_started.get(provider)
+            if started is not None:
+                wall_started, monotonic_started = started
+                receipt = engine.cancel_started(
+                    contexts[provider],
+                    started_at=wall_started,
+                    duration_ms=int(
+                        max(0.0, time.monotonic() - monotonic_started) * 1000
+                    ),
+                ).receipt
+            else:
+                receipt = engine.skip(
+                    contexts[provider], SkipReason.DEADLINE_EXCEEDED
+                ).receipt
+        receipts.append(receipt)
+
+    if not completed_providers:
+        payload["error"] = "All research providers failed"
+
+    routing_info = dict(plan.routing_metadata)
+    routing_info.setdefault(
+        "auto_routed", str(request.routing.get("provider") or "auto") == "auto"
+    )
+    routing_info.setdefault("routing_policy", ROUTING_POLICY)
+    payload = _finalize_research_result(
+        payload,
+        args=args,
+        config=config,
+        routing_info=routing_info,
+        providers_considered=providers,
+        research_providers=providers,
+        cooldown_skips=[],
+    )
+
+    raw_results = []
+    for provider in providers:
+        if provider not in completed_providers:
+            continue
+        provider_payload = payloads_by_provider.get(provider) or {}
+        provider_items = provider_payload.get("_v3_raw_results") or provider_payload.get(
+            "results"
+        ) or []
+        for item in provider_items:
+            if not isinstance(item, dict):
+                continue
+            observation = dict(item)
+            observation.setdefault("provider", provider)
+            raw_results.append(observation)
+    payload["_v3_raw_results"] = raw_results
+
+    stages = ["admission", "provider_attempt"]
+    if any(receipt.error is not None for receipt in receipts):
+        stages.append("error_classification")
+    stages.extend(["retry_circuit_update", "dedup_fingerprint"])
+    return CapabilityExecution(
+        payload=payload,
+        provider_attempts=tuple(receipts),
+        stages=tuple(stages),
+    )
+
+
+def _execute_search_v3(
+    request: RequestV3, plan: ProviderPlan, config: Dict[str, Any]
+) -> CapabilityExecution:
+    profile_error = plan.routing_metadata.get("error_type")
+    if profile_error:
+        return CapabilityExecution(
+            payload={
+                "error": plan.routing_metadata.get("error"),
+                "error_type": profile_error,
+                "provider": "auto",
+                "query": request.input["query"],
+                "results": [],
+                "metadata": {"profile": config.get("profile")},
+            },
+            stages=("admission",),
+        )
+    if str(request.options.get("mode") or "normal") == "research":
+        return _execute_research_v3(request, plan, config)
+    v3_config = config.get("v3") or {}
+    state_path = v3_config.get("state_path") or os.path.join(
+        str(CACHE_DIR), "v3", "state.sqlite3"
+    )
+    store = SQLiteStateStore(state_path)
+    budget_limit = int(
+        request.budget.get(
+            "max_provider_attempts",
+            v3_config.get("default_max_provider_attempts", 3),
+        )
+    )
+    engine = AttemptEngine(
+        store,
+        max_attempts=int(v3_config.get("max_attempts_per_provider", 2)),
+    )
+    receipts = []
+    payload = None
+    successful_provider = None
+    scope = request.request_id or plan.execution_id
+    daily_budget = _daily_preflight_budget(config)
+    max_wall_time_ms = request.budget.get("max_wall_time_ms")
+    deadline = (
+        time.monotonic() + (max_wall_time_ms / 1000)
+        if isinstance(max_wall_time_ms, int)
+        and not isinstance(max_wall_time_ms, bool)
+        and max_wall_time_ms > 0
+        else None
+    )
+
+    for provider in plan.candidate_order:
+        provider_config = config.get(provider) or {}
+        endpoint = str(
+            provider_config.get("endpoint")
+            or provider_config.get("base_url")
+            or provider_config.get("url")
+            or f"provider://{provider}/search"
+        )
+        credential = get_api_key(provider, config) or f"keyless:{provider}"
+        context = AttemptContext(
+            provider=provider,
+            capability=Capability.SEARCH,
+            endpoint=endpoint,
+            credential_fingerprint=store.fingerprint_credential(credential),
+            budget_scope=scope,
+            budget_window="request",
+            budget_limit_units=budget_limit,
+            deadline_monotonic=deadline,
+            **daily_budget,
+        )
+        if payload is not None:
+            receipts.append(
+                engine.skip(context, SkipReason.POLICY_EXCLUDED).receipt
+            )
+            continue
+        if deadline is not None and time.monotonic() >= deadline:
+            receipts.append(
+                engine.skip(context, SkipReason.DEADLINE_EXCEEDED).receipt
+            )
+            continue
+
+        def operation(current_provider=provider):
+            args = _search_args_from_v3(request, config)
+            args.provider = current_provider
+            args.allow_fallback = False
+            args.no_cache = True
+            args._v3_engine_owned_attempt = True
+            provider_payload, exit_code = _execute_search_request_core(args, config)
+            if exit_code:
+                raise ProviderRequestError(
+                    str(provider_payload.get("error") or "provider failed"),
+                    transient=False,
+                )
+            return provider_payload
+
+        attempted = engine.execute(context, operation)
+        receipts.append(attempted.receipt)
+        if attempted.payload is not None:
+            payload = attempted.payload
+            successful_provider = provider
+            continue
+
+    if payload is None:
+        payload = {
+            "error": "All providers failed",
+            "provider": plan.selected_provider,
+            "query": request.input["query"],
+            "results": [],
+            "routing": {
+                "provider": plan.selected_provider,
+                "fallback_used": False,
+            },
+            "provider_errors": [
+                {
+                    "provider": receipt.provider,
+                    "error": (
+                        receipt.error.message
+                        if receipt.error is not None
+                        else receipt.skip_reason.value
+                        if receipt.skip_reason is not None
+                        else "provider attempt failed"
+                    ),
+                }
+                for receipt in receipts
+            ],
+        }
+    else:
+        routing = payload.setdefault("routing", {})
+        requested = str(request.routing.get("provider") or "auto")
+        if requested == "auto":
+            routing.update(plan.routing_metadata)
+            routing["auto_routed"] = True
+            routing["provider"] = successful_provider
+            payload["provider"] = successful_provider
+        if successful_provider != plan.selected_provider:
+            routing["fallback_used"] = True
+            routing["original_provider"] = plan.selected_provider
+            routing["provider"] = successful_provider
+
+    stages = ["admission", "provider_attempt"]
+    if any(receipt.error is not None for receipt in receipts):
+        stages.append("error_classification")
+    stages.append("retry_circuit_update")
+    if sum(receipt.decision == "attempted" for receipt in receipts) > 1:
+        stages.append("fallback")
+    stages.append("dedup_fingerprint")
+    return CapabilityExecution(
+        payload=payload,
+        provider_attempts=tuple(receipts),
+        stages=tuple(stages),
+    )
+
+
+def _search_adapter() -> CapabilityAdapter:
+    return CapabilityAdapter(
+        capability=Capability.SEARCH,
+        plan=_plan_search_v3,
+        execute=_execute_search_v3,
+        normalize=response_from_legacy,
+        legacy_cache_lookup=_lookup_legacy_search_v3,
+    )
+
+
+def run_search_request_v3(
+    request: RequestV3,
+    *,
+    config: Optional[Dict[str, Any]] = None,
+) -> ResponseV3:
+    """Execute a native search RequestV3 through the canonical orchestrator."""
+    runtime_config = apply_profile_effects(config) if config is not None else load_config()
+    return execute_v3_request(request, _search_adapter(), runtime_config).response
+
+
 def run_search_request(
     *,
     query: str,
@@ -1493,6 +2309,8 @@ def run_search_request(
     count: int = 5,
     exa_depth: str = "normal",
     time_range: Optional[str] = None,
+    freshness: Optional[str] = None,
+    search_type: Optional[str] = None,
     include_domains: Optional[List[str]] = None,
     exclude_domains: Optional[List[str]] = None,
     mode: str = "normal",
@@ -1510,33 +2328,45 @@ def run_search_request(
     """
     if not query and not (include_domains or exclude_domains):
         return {"error": "query is required", "provider": provider, "query": query, "results": []}
-    config = config or load_config()
-    argv: List[str] = [
-        "--query", query or "",
-        "--provider", provider or "auto",
-        "--max-results", str(count),
-    ]
-    if exa_depth and exa_depth != "normal":
-        argv += ["--exa-depth", exa_depth]
-    if time_range and time_range != "none":
-        argv += ["--time-range", time_range]
-    if include_domains:
-        argv += ["--include-domains", *include_domains]
-    if exclude_domains:
-        argv += ["--exclude-domains", *exclude_domains]
-    if mode and mode != "normal":
-        argv += ["--mode", mode, "--research-time-budget", str(research_time_budget)]
-    if quality_report:
-        argv += ["--quality-report"]
-    if language and language != "auto":
-        argv += ["--language", language]
-    if country and country != "auto":
-        argv += ["--country", country]
+    try:
+        freshness = _providers.normalize_freshness(freshness)
+        search_type = _providers.normalize_search_type(search_type)
+    except ValueError as exc:
+        return {"error": str(exc), "provider": provider, "query": query, "results": []}
+    config = apply_profile_effects(config) if config is not None else load_config()
+    policy_mode = str((config.get("routing") or {}).get("policy_mode", "classic"))
+    request = legacy_request_to_v3(
+        Capability.SEARCH,
+        policy_mode=policy_mode,
+        payload={
+            "query": query,
+            "provider": provider or "auto",
+            "count": count,
+            "depth": exa_depth,
+            "time_range": time_range,
+            "freshness": freshness,
+            "search_type": search_type,
+            "include_domains": include_domains,
+            "exclude_domains": exclude_domains,
+            "mode": mode,
+            "quality_report": quality_report,
+            "research_time_budget": research_time_budget,
+            "language": language,
+            "country": country,
+        },
+    )
+    execution = execute_v3_request(request, _search_adapter(), config)
+    return v3_response_to_legacy_search(execution)
 
-    parser = build_parser(config)
-    args = parser.parse_args(argv)
-    payload, _exit_code = execute_search_request(args, config)
-    return payload
+
+def run_extract_request_v3(
+    request: RequestV3,
+    *,
+    config: Optional[Dict[str, Any]] = None,
+) -> ResponseV3:
+    """Execute a native extract RequestV3 through the canonical orchestrator."""
+    _sync_extract_dependencies()
+    return _extract.run_extract_request_v3(request, config=config or load_config())
 
 
 def run_extract_request(
@@ -1547,6 +2377,8 @@ def run_extract_request(
     include_images: bool = False,
     include_raw_html: bool = False,
     render_js: bool = False,
+    spans: bool = False,
+    spans_query: Optional[str] = None,
     config: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Run URL extraction in-process and return the result dict."""
@@ -1558,6 +2390,8 @@ def run_extract_request(
         include_images=include_images,
         include_raw_html=include_raw_html,
         render_js=render_js,
+        spans=spans,
+        spans_query=spans_query,
         config=config,
     )
 

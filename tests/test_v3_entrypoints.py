@@ -1,0 +1,642 @@
+import json
+from pathlib import Path
+from unittest import mock
+
+import jsonschema
+import pytest
+import search
+from compat_v3 import legacy_request_to_v3
+from contract_v3 import Capability, ResponseV3
+from http_client import ProviderRequestError
+
+
+CONFIG = {
+    "version": 1,
+    "auto_routing": {
+        "enabled": True,
+        "provider_priority": ["serper"],
+        "disabled_providers": [],
+    },
+}
+RESPONSE_SCHEMA = json.loads(Path("schemas/v3/response.schema.json").read_text())
+
+
+def _search_payload(provider="serper"):
+    return {
+        "provider": provider,
+        "query": "q",
+        "results": [
+            {
+                "title": "A",
+                "url": "https://example.com/a",
+                "snippet": "S",
+                "published_at": "Yesterday",
+            }
+        ],
+        "routing": {
+            "auto_routed": False,
+            "provider": provider,
+            "routing_policy": "classic-v2",
+        },
+        "metadata": {"dedup_count": 0},
+        "cached": False,
+        "deduplicated": False,
+    }
+
+
+def _extract_payload():
+    return {
+        "provider": "linkup",
+        "results": [
+            {
+                "title": "A",
+                "url": "https://example.com/a",
+                "content": "Café",
+            }
+        ],
+        "routing": {
+            "provider": "linkup",
+            "requested_provider": "linkup",
+            "fallback_used": False,
+            "fallback_errors": [],
+        },
+    }
+
+
+def test_v3_execution_can_read_but_never_writes_legacy_cache(monkeypatch):
+    dummy_key = "test-key-123456789012345678901234"
+    monkeypatch.setenv("YOU_API_KEY", dummy_key)
+    monkeypatch.setattr(search, "cache_get", lambda **_kwargs: None)
+    cache_put = mock.Mock()
+    monkeypatch.setattr(search, "cache_put", cache_put)
+    monkeypatch.setattr(search, "provider_in_cooldown", lambda _provider: (False, 0))
+    monkeypatch.setattr(
+        search, "execute_provider_with_retry", lambda _provider, fn: fn()
+    )
+    monkeypatch.setattr(
+        search,
+        "search_you",
+        lambda **_kwargs: _search_payload("you"),
+    )
+
+    runtime_config = {
+        **CONFIG,
+        "you": {"api_key": dummy_key},
+    }
+    result = search.run_search_request(
+        query="q", provider="you", count=1, config=runtime_config
+    )
+
+    assert result["results"]
+    cache_put.assert_not_called()
+
+
+def test_engine_owned_provider_call_bypasses_all_legacy_retry_and_health(monkeypatch):
+    dummy_key = "test-key-123456789012345678901234"
+    config = {**CONFIG, "you": {"api_key": dummy_key}}
+    request = legacy_request_to_v3(
+        Capability.SEARCH,
+        {"query": "q", "provider": "you", "count": 1},
+        request_id="engine-owned",
+    )
+    args = search._search_args_from_v3(request, config)
+    args.no_cache = True
+    args._v3_engine_owned_attempt = True
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("legacy health/retry seam was called")
+
+    monkeypatch.setattr(search, "provider_in_cooldown", forbidden)
+    monkeypatch.setattr(search, "execute_provider_with_retry", forbidden)
+    monkeypatch.setattr(search, "mark_provider_failure", forbidden)
+    monkeypatch.setattr(search, "reset_provider_health", forbidden)
+    monkeypatch.setattr(search, "record_provider_outcome", forbidden)
+    monkeypatch.setattr(
+        search,
+        "search_you",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            ProviderRequestError("upstream", status_code=503, transient=True)
+        ),
+    )
+
+    with pytest.raises(ProviderRequestError):
+        search._execute_search_request_core(args, config)
+
+
+def test_engine_owned_extract_call_bypasses_legacy_retry_and_health(monkeypatch):
+    config = {
+        "linkup": {"api_key": "linkup-test-key-123456789012345678"},
+        "extract": {"allow_private_urls": True},
+    }
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("legacy extract health/retry seam was called")
+
+    monkeypatch.setattr(search._extract, "provider_in_cooldown", forbidden)
+    monkeypatch.setattr(search._extract, "execute_provider_with_retry", forbidden)
+    monkeypatch.setattr(search._extract, "mark_provider_failure", forbidden)
+    monkeypatch.setattr(search._extract, "reset_provider_health", forbidden)
+    monkeypatch.setattr(
+        search._extract,
+        "extract_linkup",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            ProviderRequestError("upstream", status_code=503, transient=True)
+        ),
+    )
+
+    with pytest.raises(ProviderRequestError):
+        search._extract._extract_plus_core(
+            ["https://example.com/a"],
+            provider="linkup",
+            config=config,
+            engine_owned_attempt=True,
+        )
+
+
+def test_extract_adapter_emits_engine_attempt_receipt(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_core(**kwargs):
+        calls.append((kwargs["provider"], kwargs["engine_owned_attempt"]))
+        return _extract_payload()
+
+    monkeypatch.setattr(search._extract, "_extract_plus_core", fake_core)
+    config = {
+        "version": 1,
+        "linkup": {"api_key": "linkup-test-key-123456789012345678"},
+        "extract": {"allow_private_urls": True},
+        "v3": {"state_path": str(tmp_path / "state.sqlite3")},
+    }
+    request = legacy_request_to_v3(
+        Capability.EXTRACT,
+        {"urls": ["https://example.com/a"], "provider": "linkup"},
+        request_id="extract-attempt",
+    )
+
+    execution = search.execute_v3_request(
+        request, search._extract._extract_adapter(), config
+    )
+
+    assert calls == [("linkup", True)]
+    receipts = execution.response.provider_attempts
+    assert [receipt.provider for receipt in receipts] == list(
+        execution.plan.candidate_order
+    )
+    assert receipts[0].provider == "linkup"
+    assert receipts[0].outcome.value == "success"
+    assert all(receipt.decision == "skipped" for receipt in receipts[1:])
+    assert all(
+        receipt.skip_reason is not None
+        and receipt.skip_reason.value == "policy_excluded"
+        for receipt in receipts[1:]
+    )
+    assert all(receipt.tries == [] for receipt in receipts[1:])
+    assert "admission" in execution.stage_trace
+    assert "dedup_fingerprint" in execution.stage_trace
+
+
+def test_search_adapter_emits_engine_attempt_receipt(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_core(args, _config):
+        calls.append(
+            (args.provider, args.no_cache, args._v3_engine_owned_attempt)
+        )
+        return _search_payload(), 0
+
+    monkeypatch.setattr(search, "_execute_search_request_core", fake_core)
+    config = {
+        **CONFIG,
+        "serper": {"api_key": "test-key-123456789012345678901234"},
+        "v3": {"state_path": str(tmp_path / "state.sqlite3")},
+    }
+    request = legacy_request_to_v3(
+        Capability.SEARCH,
+        {"query": "q", "provider": "serper", "count": 1},
+        request_id="attempt-receipt",
+    )
+
+    execution = search.execute_v3_request(request, search._search_adapter(), config)
+
+    assert calls == [("serper", True, True)]
+    assert len(execution.response.provider_attempts) == 1
+    assert execution.response.provider_attempts[0].provider == "serper"
+    assert execution.response.provider_attempts[0].outcome.value == "success"
+    assert execution.stage_trace == (
+        "normalize",
+        "validate",
+        "cache_lookup",
+        "candidate_plan",
+        "admission",
+        "provider_attempt",
+        "retry_circuit_update",
+        "result_normalization",
+        "dedup_fingerprint",
+        "cache_write",
+        "response_v3",
+    )
+
+
+def test_search_degrades_with_warning_when_state_store_is_unavailable(
+    tmp_path, monkeypatch
+):
+    state_path = tmp_path / "state.sqlite3"
+    state_path.write_bytes(b"corrupt")
+    calls = []
+
+    def fake_core(_args, _config):
+        calls.append("provider")
+        return _search_payload(), 0
+
+    monkeypatch.setattr(search, "_execute_search_request_core", fake_core)
+    config = {
+        **CONFIG,
+        "serper": {"api_key": "test-key-123456789012345678901234"},
+        "v3": {"state_path": str(state_path)},
+    }
+    request = legacy_request_to_v3(
+        Capability.SEARCH,
+        {"query": "q", "provider": "serper", "count": 1},
+        request_id="degraded-state-store",
+    )
+
+    response = search.execute_v3_request(
+        request, search._search_adapter(), config
+    ).response
+
+    assert calls == ["provider"]
+    assert response.status.value == "ok"
+    assert response.provider_attempts[0].budget_decision == "store_unavailable"
+    assert any(
+        warning["code"] == "wsp.state.store_unavailable"
+        for warning in response.warnings
+    )
+
+
+def test_search_attempt_receipt_contains_endpoint_and_success_try(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        search,
+        "_execute_search_request_core",
+        lambda _args, _config: (_search_payload(), 0),
+    )
+    config = {
+        **CONFIG,
+        "serper": {"api_key": "test-key-123456789012345678901234"},
+        "v3": {"state_path": str(tmp_path / "state.sqlite3")},
+    }
+    request = legacy_request_to_v3(
+        Capability.SEARCH,
+        {"query": "q", "provider": "serper", "count": 1},
+        request_id="complete-attempt-receipt",
+    )
+
+    response = search.execute_v3_request(
+        request, search._search_adapter(), config
+    ).response
+    wire = response.provider_attempts[0].to_dict()
+
+    assert wire["endpoint_id"] == "serper:search"
+    assert len(wire["tries"]) == 1
+    assert wire["tries"][0]["try_number"] == 1
+    assert wire["tries"][0]["outcome"] == "success"
+    assert wire["tries"][0]["error"] is None
+    assert {item["provider_attempt_id"] for item in response.observations} == {
+        wire["attempt_id"]
+    }
+    jsonschema.validate(
+        response.to_dict(), RESPONSE_SCHEMA, format_checker=jsonschema.FormatChecker()
+    )
+
+
+def test_search_preserves_policy_filtered_provider_result_as_observation(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        search,
+        "search_serper",
+        lambda **_kwargs: {
+            "provider": "serper",
+            "query": "q",
+            "results": [
+                {
+                    "title": "Blocked source",
+                    "url": "https://blocked.test/article",
+                    "snippet": "must remain observable",
+                    "score": 0.9,
+                },
+                {
+                    "title": "Kept source",
+                    "url": "https://example.com/article",
+                    "snippet": "visible result",
+                    "score": 0.8,
+                },
+            ],
+            "images": [],
+            "metadata": {},
+        },
+    )
+    config = {
+        **CONFIG,
+        "serper": {"api_key": "test-key-123456789012345678901234"},
+        "quality": {
+            "filter_spam": True,
+            "blocked_domains": ["blocked.test"],
+            "max_results_per_domain": 2,
+        },
+        "v3": {"state_path": str(tmp_path / "state.sqlite3")},
+    }
+    request = legacy_request_to_v3(
+        Capability.SEARCH,
+        {
+            "query": "q",
+            "provider": "serper",
+            "count": 5,
+            "no_cache": True,
+        },
+        request_id="lossless-filtered-source",
+    )
+
+    response = search.execute_v3_request(
+        request, search._search_adapter(), config
+    ).response
+
+    observed_urls = {item["url"]["observed"] for item in response.observations}
+    projected_urls = {item["url"]["observed"] for item in response.results}
+    assert observed_urls == {
+        "https://blocked.test/article",
+        "https://example.com/article",
+    }
+    assert projected_urls == {"https://example.com/article"}
+    blocked_observation = next(
+        item
+        for item in response.observations
+        if item["url"]["observed"] == "https://blocked.test/article"
+    )
+    assert {
+        "action": "excluded",
+        "observation_id": blocked_observation["observation_id"],
+        "reason": "spam_domain",
+    } in response.policy_actions
+
+
+def test_search_records_unvisited_lower_ranked_candidates_as_skipped(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        search,
+        "_execute_search_request_core",
+        lambda _args, _config: (_search_payload(), 0),
+    )
+    config = {
+        **CONFIG,
+        "serper": {"api_key": "serper-key"},
+        "brave": {"api_key": "brave-key"},
+        "you": {"api_key": "you-key"},
+        "v3": {"state_path": str(tmp_path / "state.sqlite3")},
+    }
+    request = legacy_request_to_v3(
+        Capability.SEARCH,
+        {"query": "q", "provider": "serper", "count": 1},
+        request_id="complete-candidate-log",
+    )
+    plan = search.ProviderPlan(
+        ("serper", "brave", "you"), "serper", execution_id="exec_candidate_log"
+    )
+
+    execution = search._execute_search_v3(request, plan, config)
+    wires = [receipt.to_dict() for receipt in execution.provider_attempts]
+
+    assert [wire["provider"] for wire in wires] == ["serper", "brave", "you"]
+    assert [wire["decision"] for wire in wires] == [
+        "attempted",
+        "skipped",
+        "skipped",
+    ]
+    assert [wire["skip_reason"] for wire in wires[1:]] == [
+        "policy_excluded",
+        "policy_excluded",
+    ]
+    assert all(wire["tries"] == [] for wire in wires[1:])
+
+
+def test_search_engine_owns_typed_fallback_and_receipts(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_core(args, _config):
+        calls.append(args.provider)
+        if args.provider == "serper":
+            raise ProviderRequestError("bad key", status_code=401)
+        payload = _search_payload()
+        payload["provider"] = "you"
+        return payload, 0
+
+    monkeypatch.setattr(search, "_execute_search_request_core", fake_core)
+    config = {
+        "version": 1,
+        "auto_routing": {
+            "enabled": True,
+            "provider_priority": ["serper", "you"],
+            "disabled_providers": [],
+        },
+        "serper": {"api_key": "serper-test-key-12345678901234567890"},
+        "you": {"api_key": "you-test-key-12345678901234567890123"},
+        "v3": {"state_path": str(tmp_path / "state.sqlite3")},
+    }
+    request = legacy_request_to_v3(
+        Capability.SEARCH,
+        {"query": "q", "provider": "serper", "count": 1},
+        request_id="typed-fallback",
+    )
+    request = type(request).from_dict(
+        {
+            **request.to_dict(),
+            "routing": {**request.routing, "allow_fallback": True},
+        }
+    )
+
+    execution = search.execute_v3_request(request, search._search_adapter(), config)
+
+    assert calls == ["serper", "you"]
+    assert [attempt.outcome.value for attempt in execution.response.provider_attempts] == [
+        "failed",
+        "success",
+    ]
+    assert execution.response.provider_attempts[0].error.error_class.value == "auth"
+    assert execution.legacy_payload["routing"]["fallback_used"] is True
+    assert execution.legacy_payload["routing"]["original_provider"] == "serper"
+    assert execution.legacy_payload["routing"]["provider"] == "you"
+    assert "error_classification" in execution.stage_trace
+    assert "fallback" in execution.stage_trace
+    assert "bad key" not in json.dumps(execution.response.to_dict())
+
+
+def test_b6_engine_adapter_plan_is_identical_for_legacy_and_native(monkeypatch):
+    calls = []
+
+    def fake_core(args, config):
+        calls.append((args.query, args.provider))
+        return _search_payload(), 0
+
+    monkeypatch.setattr(search, "_execute_search_request_core", fake_core)
+    legacy_request = legacy_request_to_v3(
+        "search",
+        {"query": "same", "provider": "serper", "count": 1},
+        request_id="b6",
+    )
+    native_request = type(legacy_request).from_dict(legacy_request.to_dict())
+
+    legacy_execution = search.execute_v3_request(
+        legacy_request, search._search_adapter(), CONFIG
+    )
+    native_execution = search.execute_v3_request(
+        native_request, search._search_adapter(), CONFIG
+    )
+
+    assert legacy_execution.plan == native_execution.plan
+    assert legacy_execution.response.routing_receipt["candidate_order"] == ["serper"]
+    assert native_execution.response.cache_status["disposition"] == "fresh_hit"
+    assert native_execution.response.routing_receipt["candidate_order"] == []
+    assert native_execution.response.routing_receipt["selected_provider"] is None
+    assert calls == [("same", "serper")]
+    assert native_execution.response.cache_status["disposition"] == "fresh_hit"
+
+
+def test_search_legacy_and_native_use_same_v3_entry_and_one_core_call(monkeypatch):
+    calls = []
+
+    def fake_core(args, config):
+        calls.append((args.query, args.provider, config))
+        return _search_payload(), 0
+
+    monkeypatch.setattr(search, "_execute_search_request_core", fake_core)
+    legacy = search.run_search_request(
+        query="q", provider="serper", count=1, config=CONFIG
+    )
+    assert legacy == _search_payload()
+    assert len(calls) == 1
+
+    request = legacy_request_to_v3(
+        Capability.SEARCH,
+        {"query": "q", "provider": "serper", "count": 1},
+        request_id="native-search",
+    )
+    native = search.run_search_request_v3(request, config=CONFIG)
+
+    assert isinstance(native, ResponseV3)
+    assert native.request_id == "native-search"
+    assert native.cache_status["disposition"] == "fresh_hit"
+    assert native.routing_receipt["candidate_order"] == []
+    assert native.routing_receipt["selected_provider"] is None
+    assert native.results[0]["url"]["observed"] == "https://example.com/a"
+    assert "published_at" not in native.results[0]
+    jsonschema.validate(
+        native.to_dict(), RESPONSE_SCHEMA, format_checker=jsonschema.FormatChecker()
+    )
+    assert len(calls) == 1
+    assert native.cache_status["disposition"] == "fresh_hit"
+
+
+def test_extract_legacy_and_native_use_same_v3_entry_and_one_core_call(monkeypatch):
+    calls = []
+
+    def fake_core(**kwargs):
+        calls.append(kwargs)
+        return _extract_payload()
+
+    monkeypatch.setattr(search._extract, "_extract_plus_core", fake_core)
+    legacy = search.run_extract_request(
+        ["https://example.com/a"], provider="linkup", config=CONFIG
+    )
+    assert legacy == _extract_payload()
+    assert len(calls) == 1
+
+    request = legacy_request_to_v3(
+        Capability.EXTRACT,
+        {"urls": ["https://example.com/a"], "provider": "linkup"},
+        request_id="native-extract",
+    )
+    native = search.run_extract_request_v3(request, config=CONFIG)
+
+    assert isinstance(native, ResponseV3)
+    assert native.request_id == "native-extract"
+    assert native.cache_status["disposition"] == "fresh_hit"
+    assert native.routing_receipt["candidate_order"] == []
+    assert native.routing_receipt["selected_provider"] is None
+    assert native.results[0]["text"]["text"] == "Café"
+    assert native.results[0]["text"]["segments"] == [
+        {"start": 0, "end": 4, "text": "Café"}
+    ]
+    jsonschema.validate(
+        native.to_dict(), RESPONSE_SCHEMA, format_checker=jsonschema.FormatChecker()
+    )
+    assert len(calls) == 1
+    assert native.cache_status["disposition"] == "fresh_hit"
+
+
+def test_extract_top_level_error_preserves_quota_attempt_taxonomy(tmp_path, monkeypatch):
+    config = {
+        "exa": {"api_key": "exa-test-key-12345678901234567890"},
+        "extract": {"allow_private_urls": True},
+        "v3": {"state_path": str(tmp_path / "state.sqlite3")},
+    }
+    request = legacy_request_to_v3(
+        Capability.EXTRACT,
+        {
+            "urls": ["https://example.com/a"],
+            "provider": "exa",
+            "allow_fallback": False,
+        },
+        request_id="quota-taxonomy",
+    )
+    monkeypatch.setattr(
+        search._extract,
+        "_extract_plus_core",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            ProviderRequestError("credits exhausted", status_code=402)
+        ),
+    )
+
+    response = search._extract.run_extract_request_v3(request, config=config)
+
+    assert response.status.value == "failed"
+    assert response.provider_attempts[0].error is not None
+    assert response.error is not None
+    assert response.provider_attempts[0].error.error_class.value == "quota"
+    assert response.error.error_class.value == "quota"
+    assert response.error.code == "wsp.provider.quota"
+    assert response.error.retryable is False
+    assert response.error.http_status == 402
+
+
+def test_extract_top_level_error_preserves_config_attempt_taxonomy(tmp_path):
+    config = {
+        "extract": {"allow_private_urls": True},
+        "v3": {"state_path": str(tmp_path / "state.sqlite3")},
+    }
+    request = legacy_request_to_v3(
+        Capability.EXTRACT,
+        {
+            "urls": ["https://example.com/a"],
+            "provider": "keenable",
+            "allow_fallback": False,
+        },
+        request_id="config-taxonomy",
+    )
+
+    response = search._extract.run_extract_request_v3(request, config=config)
+
+    assert response.status.value == "failed"
+    assert response.provider_attempts[0].error is not None
+    assert response.error is not None
+    assert response.provider_attempts[0].error.error_class.value == "config"
+    assert response.error.error_class.value == "config"
+    assert response.error.code == "wsp.config.provider_invalid"
+    assert response.error.retryable is False
+
+
+def test_cli_help_does_not_advertise_answer_providers():
+    help_text = search.build_parser(CONFIG).format_help()
+
+    assert "Direct Answer" not in help_text
+    assert "Perplexity" not in help_text
+    assert "synthesized up-to-date answers" not in help_text

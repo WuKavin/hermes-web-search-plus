@@ -98,6 +98,8 @@ def fake_make_request(url, headers, body, timeout=30):
         return {"results": [{"url": RESULT_URL, "title": "You extract", "markdown": "You content", "metadata": {}}]}
     if "parallel.ai/v1/extract" in url:
         return {"results": [{"url": RESULT_URL, "title": "Parallel extract", "full_content": "Parallel content"}]}
+    if "keenable.ai/v1/search" in url:
+        return {"results": [{"title": "Keenable title", "url": RESULT_URL, "snippet": "Keenable snippet"}]}
     raise AssertionError(f"Unexpected POST URL in contract test: {url}")
 
 
@@ -134,10 +136,10 @@ SEARCH_CASES = [
     ("firecrawl", search.search_firecrawl, (QUERY, API_KEY), {}),
     ("exa", search.search_exa, (QUERY, API_KEY), {}),
     ("parallel", search.search_parallel, (QUERY, API_KEY), {}),
-    ("perplexity", search.search_perplexity, (QUERY, API_KEY), {}),
-    ("kilo-perplexity", search.search_perplexity, (QUERY, API_KEY), {"provider_name": "kilo-perplexity", "api_url": "https://api.kilo.ai/openai/v1/chat/completions", "model": "perplexity/sonar-pro"}),
+
     ("you", search.search_you, (QUERY, API_KEY), {}),
     ("searxng", search.search_searxng, (QUERY, "https://searxng.example"), {}),
+    ("keenable", search.search_keenable, (QUERY, API_KEY), {}),
 ]
 
 
@@ -152,7 +154,7 @@ def test_search_providers_return_common_contract(provider, func, args, kwargs):
     assert result["provider"] == provider
     assert result["query"] == QUERY
     assert isinstance(result["results"], list)
-    assert isinstance(result["answer"], str)
+    assert "answer" not in result
     assert isinstance(result["images"], list)
     assert isinstance(result["metadata"], dict)
 
