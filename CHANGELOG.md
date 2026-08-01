@@ -7,6 +7,46 @@
 - Added AnySearch scoring for general, Chinese, security, patent, finance, academic, legal, code, and documentation queries.
 - Fixed Chinese queries containing shared Han terms such as `今日` being misclassified as Japanese.
 - Kept Brave in the default automatic routing pool and changed the fork fallback provider to AnySearch.
+- Added line-safe multi-line Markdown output for OpenCode tool integrations, preventing extracted pages from becoming single JSON records larger than ripgrep's 64 KiB parser limit.
+
+## [v3.4.1] — 2026-07-30
+
+### ✨ Added
+- Exa now applies the unified `freshness` filter (`day`, `week`, `month`, `year`) by translating it into absolute UTC `startPublishedDate`/`endPublishedDate` bounds on `/search` and `/findSimilar`. Result metadata reports the applied date range instead of the unified token. Contributed by [@kesku](https://github.com/kesku) in [#111](https://github.com/robbyczgw-cla/hermes-web-search-plus/pull/111).
+- Added TinyFish as a bundled source-only Search provider. The adapter supports native news, freshness, locale, and domain filters and remains explicit-only by default (`auto_allow=false`).
+
+### 🐛 Fixed
+- Exa freshness metadata now reflects explicit `start_date` and `end_date` overrides instead of reporting generated bounds that were not sent upstream.
+
+### 🔒 Security and privacy
+- TinyFish requests are restricted to its fixed HTTPS Search API origin, reject redirects, cap response bodies at 2 MiB, and never use the optional `purpose`, `fetch`, Agent, or Browser paths.
+- Document TinyFish's standard-Terms training/fine-tuning allowance in the provider metadata and README instead of presenting explicit-only routing as a privacy control.
+- Link the repository to the maintained provider-by-provider Privacy & Terms guide on websearchplus.xyz.
+
+### Credits and release inventory
+- [#111](https://github.com/robbyczgw-cla/hermes-web-search-plus/pull/111) by [@kesku](https://github.com/kesku) — Exa unified freshness support via absolute UTC publication-date bounds.
+- [#115](https://github.com/robbyczgw-cla/hermes-web-search-plus/pull/115) — TinyFish explicit-only, BYOK-only source search with fail-closed input and response bounds.
+
+## [v3.4.0] — 2026-07-28
+
+### ✨ Added
+- Added Octen via Monid as a bundled, source-only Search provider through the public Provider SDK. The adapter supports native freshness plus include/exclude-domain filters and remains explicit-only by default (`auto_allow=false`).
+
+### 🔒 Security and cost controls
+- Send credentials only to Monid's fixed HTTPS API origin, reject redirects, cap response bodies at 8 MiB, sanitize upstream failures, and keep Monid lifecycle errors separate from Octen provider HTTP errors.
+- Keep Octen's answer, Broad Search, image/video, and full-content modes outside this integration. Search highlights are enabled for source snippets while billable full content is explicitly disabled.
+
+### 🐛 Fixed
+- Honor `ProviderSpec.supports_freshness` for discovered SDK Search providers so a successfully applied canonical freshness filter is no longer reported as unsupported.
+
+### 📚 Docs
+- Added a repository-specific contribution guide covering local setup, the source-only provider contract, SDK-based provider intake, CI and generated-artifact gates, changelog hygiene, security reporting, and maintainer-only release boundaries.
+- Rewrote the README introduction in plain product language and added dedicated 3.4 release notes covering Octen-via-Monid behavior, access and billing, security boundaries, and compatibility.
+
+### Release inventory
+- #110 — plain-language README introduction.
+- #112 — repository contribution guide.
+- #113 — explicit Octen source search via Monid.
 
 ## [v3.3.0] — 2026-07-24
 

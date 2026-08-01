@@ -6,7 +6,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-EXPECTED_VERSION = "3.3.0"
+EXPECTED_VERSION = "3.4.1"
 
 
 def _load_plugin_module():
@@ -54,19 +54,35 @@ def test_ci_ruff_policy_is_repo_local_and_pinned():
     assert "ruff==0.15.12" in requirements
 
 
-def test_v33_release_surfaces_preserve_upstream_attribution():
+def test_current_release_surfaces_and_attribution():
     readme = (ROOT / "README.md").read_text()
     changelog = (ROOT / "CHANGELOG.md").read_text()
-    release_notes = (ROOT / "docs/RELEASE_NOTES_V33.md").read_text()
+    release_notes = (ROOT / "docs/RELEASE_NOTES_V341.md").read_text()
     user_guide = (ROOT / "docs/USER_GUIDE.md").read_text()
     combined = "\n".join((readme, changelog, release_notes, user_guide))
 
-    assert "Current release: **v3.3.0**" in readme
-    assert "docs/RELEASE_NOTES_V33.md" in readme
+    assert "Current release: **v3.4.1**" in readme
+    assert "docs/RELEASE_NOTES_V341.md" in readme
+    assert "Exa" in release_notes
+    assert "TinyFish" in release_notes
+    assert "explicit-only" in release_notes
+    assert "training" in release_notes
     assert "https://github.com/dondai1234/master-fetch" in combined
     assert "Bishesh Bhandari" in combined
     assert "MIT-licensed" in combined or "MIT project" in combined
     assert "https://github.com/dondai1234/hound" not in combined
+
+
+def test_current_filter_help_mentions_all_new_native_support():
+    init_py = (ROOT / "__init__.py").read_text().lower()
+    search_py = (ROOT / "search.py").read_text().lower()
+    user_guide = (ROOT / "docs/USER_GUIDE.md").read_text().lower()
+
+    assert "google.serper.dev/news) and tinyfish" in init_py
+    assert "currently serper and tinyfish" in search_py
+    assert "searxng, exa, and tinyfish" in search_py
+    assert "searxng, exa, and tinyfish" in user_guide
+    assert "tinyfish serves it through its native news-domain mode" in user_guide
 
 
 def test_readme_intro_uses_plain_product_language():
