@@ -542,6 +542,29 @@ def test_failed_retention_rewrite_leaves_previous_journal_unchanged(
     assert journal.path.read_bytes() == before
 
 
+def test_journal_retries_transient_lock_creation_race(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    journal_module = importlib.import_module("operator_receipts_v3")
+    journal = journal_module.OperatorReceiptJournal(tmp_path)
+    record = fixture("receipts.json")["receipts"][0]
+    real_open = journal_module.os.open
+    lock_attempts = 0
+
+    def flaky_open(path, *args, **kwargs):
+        nonlocal lock_attempts
+        if path == ".receipts.lock":
+            lock_attempts += 1
+            if lock_attempts == 1:
+                raise FileNotFoundError("injected concurrent create race")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(journal_module.os, "open", flaky_open)
+
+    assert journal.append(record) is True
+    assert lock_attempts == 2
+
+
 def test_journal_ttl_prunes_only_owned_records(tmp_path: Path) -> None:
     journal_module = importlib.import_module("operator_receipts_v3")
     journal = journal_module.OperatorReceiptJournal(

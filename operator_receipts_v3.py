@@ -140,12 +140,20 @@ class OperatorReceiptJournal:
         with self._journal_directory() as directory_descriptor:
             flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC
             flags |= getattr(os, "O_NOFOLLOW", 0)
-            descriptor = os.open(
-                ".receipts.lock",
-                flags,
-                0o600,
-                dir_fd=directory_descriptor,
-            )
+            descriptor = -1
+            for attempt in range(3):
+                try:
+                    descriptor = os.open(
+                        ".receipts.lock",
+                        flags,
+                        0o600,
+                        dir_fd=directory_descriptor,
+                    )
+                    break
+                except FileNotFoundError:
+                    if attempt == 2:
+                        raise
+                    time.sleep(0.001 * (attempt + 1))
             try:
                 lock_stat = os.fstat(descriptor)
                 if (

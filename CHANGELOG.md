@@ -8,6 +8,24 @@
 - Fixed Chinese queries containing shared Han terms such as `今日` being misclassified as Japanese.
 - Kept Brave in the default automatic routing pool and changed the fork fallback provider to AnySearch.
 - Added line-safe multi-line Markdown output for OpenCode tool integrations, preventing extracted pages from becoming single JSON records larger than ripgrep's 64 KiB parser limit.
+- Rebased the fork on upstream v4.0.0, replacing Hound with DonSeTch while preserving AnySearch and OpenCode output compatibility.
+- Added a bounded retry for the transient macOS/APFS race when multiple processes first create the operator receipt lock file.
+- Updated the schema-test dependency lock to `fast-uri` 3.1.5, resolving GHSA-7p8r-x3mc-p8w7.
+
+## [v4.0.0] — 2026-08-16
+
+### Removed
+- Removed the optional Hound provider and `HOUND_MCP_URL` integration.
+
+### Added
+- Added the separately installed DonSeTch 2.1.0 stdio provider via `DONSETCH_BIN`.
+- Kept DonSeTch explicit-only by default; browser retrieval remains environment-dependent.
+- Added migration and attribution guidance in `docs/DONSETCH.md` and `docs/RELEASE_NOTES_V400.md`.
+
+## [v3.4.2] — 2026-08-07
+
+### 🐛 Fixed
+- Research source summaries in the public formatter now mark 500-character previews with the exact original length instead of silently truncating them.
 
 ## [v3.4.1] — 2026-07-30
 

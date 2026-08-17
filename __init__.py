@@ -1,11 +1,11 @@
 """
-web-search-plus — Hermes Plugin v3.4.1
+web-search-plus — Hermes Plugin v4.0.0
 Multi-provider web search, URL extraction, quality reports, and opt-in research mode.
 Ported from robbyczgw-cla/web-search-plus-plugin (OpenClaw) to Hermes Plugin API.
 """
 from __future__ import annotations
 
-__version__ = "3.4.1"
+__version__ = "4.0.0"
 
 import argparse
 import getpass
@@ -1644,7 +1644,10 @@ def _format_results(data: dict) -> str:
             content = (src.get("content") or src.get("raw_content") or "").strip()
             lines.append(f"{i}. {url}")
             if content:
-                lines.append(f"   {content[:500]}")
+                summary = content[:500]
+                if len(content) > 500:
+                    summary += f" [TRUNCATED: showing first 500 of {len(content)} characters]"
+                lines.append(f"   {summary}")
         lines.append("")
 
     for i, r in enumerate(results, 1):
