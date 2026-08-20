@@ -438,13 +438,28 @@ Parameters:
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `urls` | string[] | **required** | URLs to extract |
-| `provider` | string | `"auto"` | `auto`, `tavily`, `exa`, `linkup`, `parallel`, `firecrawl`, `you`, `keenable`, `serper` |
+| `provider` | string | `"auto"` | `auto`, `tavily`, `exa`, `linkup`, `parallel`, `firecrawl`, `you`, `keenable`, `serper`, `anysearch`, `donsetch` |
 | `format` | string | `"markdown"` | `markdown` or `html` |
 | `include_images` | boolean | `false` | Include image metadata when supported |
 | `include_raw_html` | boolean | `false` | Include raw HTML when supported |
 | `render_js` | boolean | `false` | Render JavaScript before extraction when supported |
 
-Auto extraction defaults to Tavily, Exa, Linkup, Parallel, Firecrawl, You.com, Keenable, then Serper when those providers are configured. DonSeTch is extraction-capable but excluded from automatic extraction and fallback unless explicitly opted in. Change only this order with `setup.py config set-extract-priority ...`; the setting is stored as `auto_routing.extract_provider_priority` and does not inherit search `provider_priority`. Partial lists are completed with missing extract providers in registry order. Serper's webpage scraper (`https://scrape.serper.dev`, overridable via config `serper.scrape_url`, timeout via `serper.extract_timeout`) remains the public default's last-resort fallback. Each URL is returned independently; one failed URL does not discard successful results from the same call.
+Auto extraction in this fork defaults to persistent smooth weighted round robin across configured AnySearch, Tavily, and Exa providers, with weights 5:3:2. Selection happens once per extraction request. The selected provider moves to the front, and all remaining configured extractors stay in the fallback chain. Explicit `provider=` requests bypass balancing. Configure the behavior in `config.json`:
+
+```json
+{
+  "auto_routing": {
+    "extract_strategy": "weighted_round_robin",
+    "extract_weights": {
+      "anysearch": 5,
+      "tavily": 3,
+      "exa": 2
+    }
+  }
+}
+```
+
+Set `extract_strategy` to `priority` to restore the upstream first-success behavior. `extract_provider_priority` remains independent from search priority and determines fallback order for extractors outside the weighted pool. DonSeTch stays excluded from automatic extraction unless explicitly opted in. Serper's webpage scraper (`https://scrape.serper.dev`, overridable via config `serper.scrape_url`, timeout via `serper.extract_timeout`) remains available as a fallback. Each URL is returned independently; one failed URL does not discard successful results from the same call.
 
 Parallel extraction explicitly requests `full_content`. Its default budget is 60,000 characters per result and 120,000 characters total so long documents are not unfairly shortened compared with other extraction providers. Operators can override those request-side limits in `config.json` with `parallel.max_chars_per_result` and `parallel.max_chars_total`.
 

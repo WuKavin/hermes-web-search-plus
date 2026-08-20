@@ -11,6 +11,7 @@
 - Rebased the fork on upstream v4.0.0, replacing Hound with DonSeTch while preserving AnySearch and OpenCode output compatibility.
 - Added a bounded retry for the transient macOS/APFS race when multiple processes first create the operator receipt lock file.
 - Updated the schema-test dependency lock to `fast-uri` 3.1.5, resolving GHSA-7p8r-x3mc-p8w7.
+- Added persistent, cross-process-safe weighted round robin for automatic extraction, defaulting to AnySearch 50%, Tavily 30%, and Exa 20% while preserving fallback and explicit-provider behavior.
 
 ## [v4.0.0] — 2026-08-16
 

@@ -46,6 +46,10 @@ def _load_env_file():
     """Load plugin-local, legacy parent, and Hermes profile .env files."""
     load_env_files(__file__)
 
+SUPPORTED_EXTRACT_STRATEGIES = {"priority", "weighted_round_robin"}
+DEFAULT_EXTRACT_WEIGHTS = {"anysearch": 5, "tavily": 3, "exa": 2}
+
+
 DEFAULT_CONFIG = {
     "version": 1,
     "profile": "standard",
@@ -72,6 +76,8 @@ DEFAULT_CONFIG = {
         # without being selected automatically.
         "provider_priority": list(DEFAULT_PROVIDER_PRIORITY),
         "extract_provider_priority": list(EXTRACT_PROVIDER_IDS),
+        "extract_strategy": "weighted_round_robin",
+        "extract_weights": dict(DEFAULT_EXTRACT_WEIGHTS),
         "disabled_providers": [],
         "auto_allow": dict(DEFAULT_AUTO_ALLOW),
         "confidence_threshold": 0.3,  # Below this, note low confidence
@@ -300,6 +306,23 @@ def _append_missing_extract_providers(providers: List[str]) -> List[str]:
     return list(providers) + [provider for provider in EXTRACT_PROVIDER_IDS if provider not in seen]
 
 
+def normalize_extract_provider_weights(value: Any) -> Dict[str, int]:
+    if not isinstance(value, dict):
+        raise ValueError("extract_weights must be an object mapping extract providers to integer weights")
+    extract_providers = set(EXTRACT_PROVIDER_IDS)
+    weights: Dict[str, int] = {}
+    for raw_provider, raw_weight in value.items():
+        provider = _normalize_routing_provider_config(str(raw_provider))
+        if provider not in extract_providers:
+            raise ValueError(f"provider does not support extraction: {provider}")
+        if isinstance(raw_weight, bool) or not isinstance(raw_weight, int) or not 1 <= raw_weight <= 100:
+            raise ValueError(f"extract weight for {provider} must be an integer between 1 and 100")
+        weights[provider] = raw_weight
+    if not weights:
+        raise ValueError("extract_weights cannot be empty")
+    return weights
+
+
 def is_self_hosted_profile(config: Dict[str, Any]) -> bool:
     """Return whether a runtime config selects the no-paid-key profile."""
     return config.get("profile", "standard") == "self_hosted"
@@ -332,6 +355,7 @@ def apply_profile_effects(config: Dict[str, Any]) -> Dict[str, Any]:
     auto["provider_priority"] = list(SELF_HOSTED_SEARCH_PROVIDER_IDS)
     auto["fallback_provider"] = "keenable"
     auto["extract_provider_priority"] = list(SELF_HOSTED_EXTRACT_PROVIDER_IDS)
+    auto["extract_strategy"] = "priority"
     auto["auto_allow"] = {
         provider: provider in SELF_HOSTED_SEARCH_PROVIDER_IDS
         for provider, spec in PROVIDER_SPECS.items()
@@ -375,6 +399,15 @@ def _validate_runtime_config(config: Dict[str, Any]) -> Dict[str, Any]:
         auto["extract_provider_priority"] = _append_missing_extract_providers(extract_priority)
     else:
         auto["extract_provider_priority"] = list(EXTRACT_PROVIDER_IDS)
+    strategy = str(auto.get("extract_strategy", "priority")).strip().lower()
+    if strategy not in SUPPORTED_EXTRACT_STRATEGIES:
+        raise ValueError(
+            "extract_strategy must be one of: " + ", ".join(sorted(SUPPORTED_EXTRACT_STRATEGIES))
+        )
+    auto["extract_strategy"] = strategy
+    auto["extract_weights"] = normalize_extract_provider_weights(
+        auto.get("extract_weights", DEFAULT_EXTRACT_WEIGHTS)
+    )
     if "disabled_providers" in auto:
         disabled = auto.get("disabled_providers") or []
         if disabled:

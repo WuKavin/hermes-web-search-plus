@@ -48,6 +48,8 @@ python ~/.hermes/plugins/web-search-plus/setup.py config set-extract-priority se
 
 This writes `auto_routing.extract_provider_priority`; it never changes search `provider_priority`. Omitted extract-capable providers are appended in registry order. See [User Guide → Bench your providers](USER_GUIDE.md#bench-your-providers).
 
+This fork also supports extraction load balancing. The default `weighted_round_robin` strategy assigns AnySearch, Tavily, and Exa weights of 5, 3, and 2. Change `auto_routing.extract_weights` in `config.json`, or set `auto_routing.extract_strategy` to `priority` to restore fixed first-success routing. Failed weighted primaries continue through the remaining extraction fallback chain.
+
 ## How do I force one provider?
 
 Per call:

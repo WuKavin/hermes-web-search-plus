@@ -20,6 +20,7 @@ from config import (
     load_config,
 )
 from cache import CACHE_DIR
+from extract_load_balancer import order_extract_candidates
 from cache_identity_v3 import ExtractionCacheIdentityV3
 from bounded_context_v3 import (
     DEFAULT_FULL_TEXT_MAX_BYTES,
@@ -255,11 +256,18 @@ def _extract_plus_core(
             for candidate in priority
             if _extract_provider_auto_allowed(candidate, auto_config)
         ]
-        base_providers = (
-            automatic
-            if selected == "auto"
-            else [selected] + [candidate for candidate in automatic if candidate != selected]
-        )
+        if selected == "auto":
+            configured_automatic = [
+                candidate
+                for candidate in automatic
+                if get_api_key(candidate, config) or keyless_public_allowed(candidate, config)
+            ]
+            ordered = order_extract_candidates(configured_automatic, config)
+            base_providers = ordered + [
+                candidate for candidate in automatic if candidate not in configured_automatic
+            ]
+        else:
+            base_providers = [selected] + [candidate for candidate in automatic if candidate != selected]
     providers = [
         candidate
         for candidate in base_providers
@@ -365,7 +373,7 @@ def _plan_extract_v3(request: RequestV3, config: Dict[str, Any]) -> ProviderPlan
         if _extract_provider_auto_allowed(provider, auto_config)
     ]
     if selected == "auto":
-        candidates = automatic
+        candidates = order_extract_candidates(automatic, config)
         if not candidates:
             candidates = [
                 provider

@@ -157,7 +157,7 @@ class ExtractPlusCoreTests(unittest.TestCase):
         self.assertEqual(body["formats"], ["markdown", "html", "metadata"])
 
     def test_extract_plus_auto_prefers_tavily_when_available(self):
-        with mock.patch.dict(os.environ, {"TAVILY_API_KEY": "tvly-test", "FIRECRAWL_API_KEY": "fc-test", "LINKUP_API_KEY": "linkup-test"}, clear=False):
+        with mock.patch.dict(os.environ, {"TAVILY_API_KEY": "tvly-test", "FIRECRAWL_API_KEY": "fc-test", "LINKUP_API_KEY": "linkup-test"}, clear=True):
             with mock.patch("search.extract_tavily", return_value={"provider": "tavily", "results": []}) as mock_tavily:
                 result = search.extract_plus(["https://example.com"], provider="auto")
 

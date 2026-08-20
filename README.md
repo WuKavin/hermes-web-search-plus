@@ -65,6 +65,8 @@ python3 search.py --query "Hermes Agent latest release" --provider auto --qualit
 
 Web Search Plus supports 16 search and 10 extraction providers in this fork — you do **not** need them all. One search-capable key or configured local endpoint enables `web_search_plus`; one extraction-capable key or endpoint enables `web_extract_plus`; more providers just make controlled routing more flexible. The setup helper stores keys in the active Hermes environment file — never commit them to the repository.
 
+This fork balances automatic extraction across configured AnySearch, Tavily, and Exa providers with smooth weighted round robin at a 5:3:2 ratio. The selected provider is tried first and every remaining provider stays in the fallback chain. Explicit `provider=` requests bypass load balancing.
+
 Provider privacy is not uniform. Before sending sensitive queries or URLs, review the maintained [Provider Privacy & Terms guide](https://websearchplus.xyz/providers.html#privacy-terms), which distinguishes standard self-serve terms from enterprise-only ZDR or no-training options.
 
 ### Upgrading to 4.0.0

@@ -51,8 +51,11 @@ try:  # Package load path used by Hermes plugin discovery.
     from .env_loader import clean_env_value as _shared_clean_env_value, get_hermes_env_path, is_truthy, load_env_files
     from .cache import MAX_STORED_TEXT_CHARS, store_web_text
     from .config import (
+        DEFAULT_EXTRACT_WEIGHTS,
+        SUPPORTED_EXTRACT_STRATEGIES,
         apply_profile_effects,
         load_config,
+        normalize_extract_provider_weights,
     )
 except ImportError:  # Direct script/test imports from the plugin directory.
     from provider_registry import (
@@ -71,7 +74,13 @@ except ImportError:  # Direct script/test imports from the plugin directory.
     )
     from env_loader import clean_env_value as _shared_clean_env_value, get_hermes_env_path, is_truthy, load_env_files
     from cache import MAX_STORED_TEXT_CHARS, store_web_text
-    from config import apply_profile_effects, load_config
+    from config import (
+        DEFAULT_EXTRACT_WEIGHTS,
+        SUPPORTED_EXTRACT_STRATEGIES,
+        apply_profile_effects,
+        load_config,
+        normalize_extract_provider_weights,
+    )
 
 try:
     from .daemon_tasks import DaemonTask
@@ -373,6 +382,8 @@ def _default_behavior_config() -> Dict[str, Any]:
             "fallback_provider": "anysearch",
             "provider_priority": list(_DEFAULT_PROVIDER_PRIORITY),
             "extract_provider_priority": list(_DEFAULT_EXTRACT_PROVIDER_PRIORITY),
+            "extract_strategy": "weighted_round_robin",
+            "extract_weights": dict(DEFAULT_EXTRACT_WEIGHTS),
             "disabled_providers": [],
             "auto_allow": dict(_DEFAULT_AUTO_ALLOW),
             "confidence_threshold": 0.3,
@@ -491,6 +502,18 @@ def _merge_behavior_config(user_config: Mapping[str, Any]) -> Dict[str, Any]:
         else:
             extract_priority = _normalize_extract_provider_csv(",".join(str(p) for p in auto_user["extract_provider_priority"]))
         auto["extract_provider_priority"] = _append_missing_extract_providers(extract_priority)
+    if "extract_strategy" in auto_user:
+        strategy = str(auto_user.get("extract_strategy") or "").strip().lower()
+        if strategy not in SUPPORTED_EXTRACT_STRATEGIES:
+            raise SystemExit(
+                "extract_strategy must be one of: " + ", ".join(sorted(SUPPORTED_EXTRACT_STRATEGIES))
+            )
+        auto["extract_strategy"] = strategy
+    if "extract_weights" in auto_user:
+        try:
+            auto["extract_weights"] = normalize_extract_provider_weights(auto_user["extract_weights"])
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
     if "disabled_providers" in auto_user:
         disabled = auto_user.get("disabled_providers") or []
         if isinstance(disabled, str):
@@ -616,6 +639,10 @@ def _routing_summary(config: Mapping[str, Any]) -> str:
         f"  fallback provider: {auto.get('fallback_provider', 'serper')}",
         "  search priority: " + ", ".join(auto.get("provider_priority", _DEFAULT_PROVIDER_PRIORITY)),
         "  extract priority: " + ", ".join(auto.get("extract_provider_priority", _DEFAULT_EXTRACT_PROVIDER_PRIORITY)),
+        f"  extract strategy: {auto.get('extract_strategy', 'priority')}",
+        "  extract weights: " + ", ".join(
+            f"{provider}={weight}" for provider, weight in (auto.get("extract_weights") or {}).items()
+        ),
         "  disabled: " + (", ".join(auto.get("disabled_providers", [])) or "none"),
         "  auto-allow false: " + (
             ", ".join(p for p, allowed in sorted((auto.get("auto_allow") or {}).items()) if allowed is False) or "none"

@@ -62,22 +62,26 @@ Default routing config includes:
 {
   "auto_routing": {
     "enabled": true,
-    "fallback_provider": "serper",
-    "provider_priority": ["you", "serper", "exa", "firecrawl", "tavily", "linkup", "parallel", "brave", "serpbase", "querit", "searxng", "keenable"],
-    "extract_provider_priority": ["tavily", "exa", "linkup", "parallel", "firecrawl", "you", "keenable", "serper"],
+    "fallback_provider": "anysearch",
+    "provider_priority": ["you", "serper", "exa", "firecrawl", "tavily", "linkup", "brave", "parallel", "serpbase", "querit", "searxng", "keenable", "anysearch"],
+    "extract_provider_priority": ["tavily", "exa", "linkup", "parallel", "firecrawl", "you", "keenable", "serper", "anysearch", "donsetch"],
+    "extract_strategy": "weighted_round_robin",
+    "extract_weights": {"anysearch": 5, "tavily": 3, "exa": 2},
     "disabled_providers": [],
     "auto_allow": {
       "serpbase": false,
       "querit": false,
-      "brave": false,
-      "parallel": false
+      "parallel": false,
+      "donsetch": false,
+      "octen": false,
+      "tinyfish": false
     },
     "confidence_threshold": 0.3
   }
 }
 ```
 
-Secrets and routing are separate so users can configure a provider key without automatically letting that provider receive automatic traffic. Search `provider_priority` and `extract_provider_priority` are independent: search ranking does not silently reorder URL extraction. A partial extraction list is normalized and completed with missing extract-capable providers in registry order.
+Secrets and routing are separate so users can configure a provider key without automatically letting that provider receive automatic traffic. Search and extraction routing are independent. Automatic extraction uses persistent smooth weighted round robin across configured providers named in `extract_weights`; the weighted primary is moved to the front of `extract_provider_priority`, and every remaining provider stays available for fallback. Explicit provider requests bypass load balancing. The self-hosted profile forces the legacy `priority` strategy because Keenable is its only automatic extractor.
 
 ## Routing engine
 
