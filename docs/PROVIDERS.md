@@ -17,7 +17,7 @@ and the plugin provider catalog; regenerate it with `python scripts/gen_provider
 | Linkup | ✅ | ✅ | `LINKUP_API_KEY` | — | yes (priority 6) | €5 free monthly credits (~5,000 standard extracts) | https://www.linkup.so |
 | Exa | ✅ | ✅ | `EXA_API_KEY` | — | yes (priority 3) | 1,000 free searches/month | https://dashboard.exa.ai/api-keys |
 | Firecrawl | ✅ | ✅ | `FIRECRAWL_API_KEY` | — | yes (priority 4) | 500 one-time credits | https://www.firecrawl.dev/app/api-keys |
-| Parallel | ✅ | ✅ | `PARALLEL_API_KEY` | — | explicit-only (`auto_allow=false`) | API key required | https://platform.parallel.ai |
+| Parallel | ✅ | ✅ | `PARALLEL_API_KEY` | — | yes (priority 8) | API key required | https://platform.parallel.ai |
 | Perplexity | — | — | `PERPLEXITY_API_KEY` | — | — | API key required | https://www.perplexity.ai/settings/api |
 | Kilo Code Perplexity bridge | — | — | `KILOCODE_API_KEY` | — | — | Depends on Kilo account | https://kilo.ai |
 | You.com | ✅ | ✅ | `YOU_API_KEY` | — | yes (priority 1) | Limited/API key required | https://api.you.com |
@@ -104,7 +104,7 @@ AI-native vertical search for code, academic, security, legal, finance, and mult
 
 ### DonSeTch (local MCP)
 
-Local DonSeTch 2.x stdio MCP provider for metasearch, direct extraction, PDF/OCR-aware fetching, and optional browser escalation.
+Local DonSeTch 3.x stdio MCP provider for metasearch, direct extraction, PDF/OCR-aware fetching, and optional browser escalation.
 
 ### Octen via Monid
 

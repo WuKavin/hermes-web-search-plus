@@ -12,6 +12,32 @@
 - Added a bounded retry for the transient macOS/APFS race when multiple processes first create the operator receipt lock file.
 - Updated the schema-test dependency lock to `fast-uri` 3.1.5, resolving GHSA-7p8r-x3mc-p8w7.
 - Added persistent, cross-process-safe weighted round robin for automatic extraction, defaulting to AnySearch 50%, Tavily 30%, and Exa 20% while preserving fallback and explicit-provider behavior.
+- Synced the fork with upstream v4.0.3 while retaining AnySearch, OpenCode line-safe output, and weighted extraction routing compatibility.
+
+## [v4.0.3] — 2026-08-25
+
+### Changed
+- Bump the tested DonSeTch version to 3.2.1. Live stdio Search and Fetch still
+  work; 2.x binaries now report `incompatible_major`.
+- Correct Architecture `auto_allow` examples so Brave and Parallel match the
+  live registry defaults.
+
+## [v4.0.2] — 2026-08-22
+
+### Added
+- Parallel Search accepts `parallel.mode` (`turbo`, `fast`, `basic`, `advanced`). The default is `fast`; set `advanced` or use research mode for deeper work.
+- Parallel now joins the default auto-routing pool when a key is configured. Operators can still set `auto_allow.parallel=false`.
+
+## [v4.0.1] — 2026-08-17
+
+### Fixed
+- DonSeTch multi-URL extraction now reuses one initialized stdio MCP session per `web_extract_plus` request instead of starting a new process for every URL.
+- DonSeTch subprocesses are reaped on timeout, initialize failure, tool errors, malformed MCP output, and broken pipes.
+- `setup.py status` reports DonSeTch binary readiness (missing / not executable / version / compatibility) instead of treating `DONSETCH_BIN` as an API key.
+
+### Changed
+- Bump the tested DonSeTch version to 2.3.1 (live-tested for stdio Search and multi-URL Fetch).
+- DonSeTch captures a bounded, sanitized stderr excerpt for diagnostics. Successful Search/Extract payloads do not include raw stderr.
 
 ## [v4.0.0] — 2026-08-16
 

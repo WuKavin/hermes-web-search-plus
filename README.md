@@ -19,7 +19,19 @@ It adds two Hermes tools:
 
 > Ported from [web-search-plus-plugin](https://github.com/robbyczgw-cla/web-search-plus-plugin) for the [Hermes Agent](https://github.com/NousResearch/hermes-agent) plugin API.
 
-Current release: **v4.0.0** — see the [Changelog](CHANGELOG.md) and [4.0.0 Release Notes](docs/RELEASE_NOTES_V400.md).
+Current release: **v4.0.3** — see the [Changelog](CHANGELOG.md). The 4.0.0 DonSeTch migration notes remain in [4.0.0 Release Notes](docs/RELEASE_NOTES_V400.md).
+
+### What's new in 4.0.3
+
+The local DonSeTch adapter is now tested against 3.2.1. Install `donsetch@3.2.1`. Older 2.x binaries report `incompatible_major`.
+
+### What's new in 4.0.2
+
+Parallel Search can now take `parallel.mode` (`turbo`, `fast`, `basic`, `advanced`). The default is `fast`. Parallel now joins automatic routing when a key is configured.
+
+### What's new in 4.0.1
+
+DonSeTch now reuses one stdio MCP session for every URL in a single extract call, reaps the child on timeout or MCP failure, and reports binary readiness from `setup.py status`. Search and Extract stay explicit-only.
 
 This fork adds AnySearch as a production Provider SDK integration for search and extraction, promotes it for multilingual and high-value vertical queries, keeps Brave in the automatic Routing v2 pool, and provides line-safe Markdown output for OpenCode tools.
 
@@ -71,7 +83,7 @@ Provider privacy is not uniform. Before sending sensitive queries or URLs, revie
 
 ### Upgrading to 4.0.0
 
-The core tools and existing keyed providers remain available, but the optional Hound integration was removed. If you used Hound, follow the [DonSeTch migration guide](docs/DONSETCH.md#migration-from-hound): install DonSeTch 2.1.0 separately, set `DONSETCH_BIN`, and change explicit `provider="hound"` calls to `provider="donsetch"`.
+The core tools and existing keyed providers remain available, but the optional Hound integration was removed. If you used Hound, follow the [DonSeTch migration guide](docs/DONSETCH.md#migration-from-hound): install DonSeTch 3.2.1 separately, set `DONSETCH_BIN`, and change explicit `provider="hound"` calls to `provider="donsetch"`.
 
 ### Self-hosted / no-paid-key profile
 
