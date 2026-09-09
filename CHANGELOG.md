@@ -13,6 +13,9 @@
 - Updated the schema-test dependency lock to `fast-uri` 3.1.5, resolving GHSA-7p8r-x3mc-p8w7.
 - Added persistent, cross-process-safe weighted round robin for automatic extraction, defaulting to AnySearch 50%, Tavily 30%, and Exa 20% while preserving fallback and explicit-provider behavior.
 - Synced the fork with upstream v4.0.3 while retaining AnySearch, OpenCode line-safe output, and weighted extraction routing compatibility.
+- Fixed search queries and `spans_query` values beginning with `-` (for example `-site:reddit.com`, literal `--`, or `--help`) being re-parsed as CLI options by the V3 argument projection and the subprocess fallbacks; structured request data is now assigned directly and subprocess calls use attached `--query=`/`--spans-query=` forms (aligned with upstream 4400fc9).
+- Fixed the Brave and AnySearch routing tests patching `search.provider_configured` instead of the `search.get_api_key` seam that routing actually uses, which made CI fail in clean environments without provider keys.
+- Updated the schema-test dependency lock to `fast-uri` 3.1.7, resolving the newly disclosed host-confusion and SSRF advisories (GHSA-5jgf-p345-68v8 and related).
 
 ## [v4.0.3] — 2026-08-25
 

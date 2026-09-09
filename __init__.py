@@ -1492,7 +1492,7 @@ def _run_search_subprocess(
     cmd = [
         sys.executable,
         str(_SEARCH_SCRIPT),
-        "--query", query,
+        f"--query={query}",
         "--provider", provider,
         "--max-results", str(count),
         "--compact",
@@ -1613,7 +1613,7 @@ def _run_extract_subprocess(
     if spans:
         cmd.append("--spans")
     if spans_query is not None:
-        cmd.extend(["--spans-query", spans_query])
+        cmd.append(f"--spans-query={spans_query}")
 
     env = os.environ.copy()
     try:

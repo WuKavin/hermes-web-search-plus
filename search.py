@@ -687,6 +687,15 @@ def build_parser_for_tests() -> argparse.ArgumentParser:
     return parser
 
 
+class _StoreQueryText(argparse.Action):
+    """Preserve literal -- on Python 3.10 as well as newer argparse versions."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        # Python 3.10 strips '--' even from a single attached option value.
+        # With nargs=None this empty list cannot represent omitted input.
+        setattr(namespace, self.dest, "--" if values == [] else values)
+
+
 def build_parser(config: Dict[str, Any]) -> argparse.ArgumentParser:
     """Build the search.py CLI argument parser.
 
@@ -779,6 +788,7 @@ Full docs: See README.md and SKILL.md
     )
     parser.add_argument(
         "--query", "-q", 
+        action=_StoreQueryText,
         help="Search query"
     )
     parser.add_argument(
@@ -797,7 +807,7 @@ Full docs: See README.md and SKILL.md
     parser.add_argument("--include-raw-html", action="store_true", help="Include raw HTML when supported")
     parser.add_argument("--render-js", action="store_true", help="Render JavaScript before extraction when supported")
     parser.add_argument("--spans", action="store_true", help="Select deterministic semantic spans from extracted text")
-    parser.add_argument("--spans-query", help="Query used to rank extracted semantic spans")
+    parser.add_argument("--spans-query", action=_StoreQueryText, help="Query used to rank extracted semantic spans")
     parser.add_argument(
         "--max-results", "-n", 
         type=int, 
@@ -1897,41 +1907,33 @@ def _daily_preflight_budget(config: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _search_args_from_v3(request: RequestV3, config: Dict[str, Any]):
+    # Keep CLI defaults, but never parse request data as command-line syntax.
+    args = build_parser(config).parse_args([])
     options = request.options
     routing_request = request.routing
-    argv: List[str] = [
-        "--query", request.input["query"],
-        "--provider", str(routing_request.get("provider") or "auto"),
-        "--max-results", str(options.get("max_results", 5)),
-    ]
-    if options.get("depth", "normal") != "normal":
-        argv += ["--exa-depth", str(options["depth"])]
-    if options.get("time_range"):
-        argv += ["--time-range", str(options["time_range"])]
-    if options.get("freshness"):
-        argv += ["--freshness", str(options["freshness"])]
-    if options.get("search_type"):
-        argv += ["--search-type", str(options["search_type"])]
-    if options.get("include_domains"):
-        argv += ["--include-domains", *options["include_domains"]]
-    if options.get("exclude_domains"):
-        argv += ["--exclude-domains", *options["exclude_domains"]]
-    if options.get("mode", "normal") != "normal":
-        argv += ["--mode", str(options["mode"]), "--research-time-budget", str(options.get("research_time_budget", 55.0))]
-    if options.get("quality_report"):
-        argv += ["--quality-report"]
+    args.query = request.input["query"]
+    args.provider = routing_request.get("provider") or "auto"
+    args.max_results = options.get("max_results", 5)
+    args.exa_depth = options.get("depth", "normal")
+    for name in ("time_range", "freshness", "search_type", "quality_report"):
+        if options.get(name):
+            setattr(args, name, options[name])
+    for name in ("include_domains", "exclude_domains"):
+        if options.get(name):
+            setattr(args, name, list(options[name]))
+    args.mode = options.get("mode", "normal")
+    if args.mode != "normal":
+        args.research_time_budget = options.get("research_time_budget", 55.0)
     locale = options.get("locale") or {}
-    if locale.get("language"):
-        argv += ["--language", str(locale["language"])]
-    if locale.get("country"):
-        argv += ["--country", str(locale["country"])]
+    for name in ("language", "country"):
+        if locale.get(name):
+            setattr(args, name, locale[name])
     if routing_request.get("allow_fallback") and routing_request.get("mode") == "fixed":
-        argv += ["--allow-fallback"]
+        args.allow_fallback = True
     if request.cache.get("mode") == "bypass":
-        argv += ["--no-cache"]
+        args.no_cache = True
     if "ttl_seconds" in request.cache:
-        argv += ["--cache-ttl", str(request.cache["ttl_seconds"])]
-    args = build_parser(config).parse_args(argv)
+        args.cache_ttl = request.cache["ttl_seconds"]
     args._v3_no_legacy_cache_write = True
     return args
 

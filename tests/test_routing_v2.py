@@ -262,10 +262,12 @@ def test_chinese_query_is_not_misclassified_as_japanese():
 def test_anysearch_wins_high_value_vertical_queries_without_specialist_keys():
     config = search._deepcopy_default_config()
 
+    # Patch the seam that _sync_routing_dependencies() actually forwards into
+    # routing.py; patching search.provider_configured has no effect there.
     def configured(provider, _config=None):
-        return provider in {"anysearch", "brave", "tavily", "exa"}
+        return "test-key" if provider in {"anysearch", "brave", "tavily", "exa"} else None
 
-    with mock.patch.object(search, "provider_configured", side_effect=configured):
+    with mock.patch.object(search, "get_api_key", side_effect=configured):
         routes = {
             query: search.QueryAnalyzer(config).route(query)["provider"]
             for query in (
@@ -282,10 +284,12 @@ def test_anysearch_wins_high_value_vertical_queries_without_specialist_keys():
 def test_brave_is_in_default_auto_pool_and_wins_shopping_news():
     config = search._deepcopy_default_config()
 
+    # Patch the seam that _sync_routing_dependencies() actually forwards into
+    # routing.py; patching search.provider_configured has no effect there.
     with mock.patch.object(
         search,
-        "provider_configured",
-        side_effect=lambda provider, _config=None: provider in {"brave", "tavily", "exa", "anysearch"},
+        "get_api_key",
+        side_effect=lambda provider, _config=None: "test-key" if provider in {"brave", "tavily", "exa", "anysearch"} else None,
     ):
         routing = search.QueryAnalyzer(config).route("latest iPhone 16 price today")
 
